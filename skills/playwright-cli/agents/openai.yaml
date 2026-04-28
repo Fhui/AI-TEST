@@ -1,0 +1,4 @@
+interface:
+  display_name: "Playwright CLI"
+  short_description: "Drive browser sessions with playwright-cli"
+  default_prompt: "Use $playwright-cli to inspect and interact with this web page via playwright-cli."

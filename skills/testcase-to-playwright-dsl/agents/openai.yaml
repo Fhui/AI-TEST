@@ -1,0 +1,4 @@
+interface:
+  display_name: "测试用例转 Playwright DSL"
+  short_description: "将测试用例 Markdown 转换为 UI DSL。"
+  default_prompt: "使用 $testcase-to-playwright-dsl 将 ./<delivery-name>/testcase/xmind-testcases.md 转换为 ./<delivery-name>/ui-dsl/ui-test.dsl.yaml。"

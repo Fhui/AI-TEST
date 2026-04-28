@@ -1,0 +1,21 @@
+# Generated delivery artifacts
+/login-flow/
+
+# Local agent state
+/.claude/
+/.codex/
+
+# Local Playwright CLI state
+/.playwright-cli/
+
+# Local PRD files
+/claude-queue-return-order-prd.md
+/cloud-queue-return-order-prd.md
+
+# Python/cache artifacts
+__pycache__/
+*.pyc
+*~
+
+# Local MCP scratch files
+/mcp-test/

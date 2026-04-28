@@ -1,0 +1,4 @@
+interface:
+  display_name: "Playwright DSL 转 Spec"
+  short_description: "将 UI DSL YAML 转换为 Playwright spec.ts。"
+  default_prompt: "使用 $playwright-dsl-to-spec 将 ./<delivery-name>/ui-dsl/ui-test.dsl.yaml 转换为 ./<delivery-name>/playwright/tests/*.spec.ts。"
