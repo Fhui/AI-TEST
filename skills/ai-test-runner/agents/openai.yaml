@@ -1,0 +1,4 @@
+interface:
+  display_name: "AI Test Runner"
+  short_description: "调度 PRD 到 Playwright 的测试流水线"
+  default_prompt: "使用 $ai-test-runner 从 PRD、DSL、spec 或已有 delivery 执行 AI 测试流水线。"

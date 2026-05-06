@@ -19,6 +19,14 @@ This skill may:
 
 This skill does not require generating `.spec.ts` files unless the user explicitly asks for test code.
 
+When running Playwright tests for this AI test pipeline, always use the fixed JSON reporter contract:
+
+```bash
+PLAYWRIGHT_HTML_OPEN=never PLAYWRIGHT_JSON_OUTPUT_NAME=./<delivery-name>/playwright/results.json npx playwright test ./<delivery-name>/playwright/tests --reporter=json
+```
+
+If a base URL is required, prepend `BASE_URL=<baseURL>` and keep the same `PLAYWRIGHT_JSON_OUTPUT_NAME` path.
+
 ## Command Selection
 
 Prefer `playwright-cli` when available.

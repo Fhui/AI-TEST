@@ -1,11 +1,11 @@
 ---
 name: dsl-selector-enrichment
-description: 对已生成的 UI DSL 做生产级 selector 补全与校准，支持 dry 候选生成和 probe 受控探测两种模式。适用于读取交付目录中的 ui-dsl/ui-test.dsl.yaml，probe v1 仅允许 goto/wait_for 进入可探测页面，再对每个 flow steps 中用到的 todo target selector 做 Playwright locator count 校准，并输出 enriched DSL、补全报告和未解决清单；不生成 spec，不运行测试，不做业务断言。
+description: 对已生成的 UI DSL 做生产级 selector 补全与校准，支持 dry 候选生成和 probe 受控状态推进两种模式。适用于读取交付目录中的 ui-dsl/ui-test.dsl.yaml，通过 seed selector、安全 click、runtime-confirmed click、reuse-session 和 Playwright locator count 校准 todo selector，并输出 enriched DSL、补全报告和未解决清单；不生成 spec，不运行测试，不做业务断言。
 ---
 
 # DSL Selector 补全与校准
 
-使用本 skill 对 UI DSL 进行全流程 selector 补全。它不是自动化测试执行，而是受控探测执行：probe v1 仅允许执行 `goto` 与 `wait_for`，然后对当前 flow steps 中实际用到的 todo target selector 做 locator count 探测。
+使用本 skill 对 UI DSL 进行全流程 selector 补全。它不是自动化测试执行，而是受控探测执行：probe 模式允许在严格安全边界内推进页面状态，然后对当前 flow steps 中实际用到的 todo target selector 做 locator count 探测。
 
 禁止生成 Playwright spec，禁止运行 `npx playwright test`，禁止修改 DSL schema，禁止修改 `testcase-to-playwright-dsl` 或 `playwright-dsl-to-spec`，禁止做业务断言。
 
@@ -39,10 +39,16 @@ dry 模式是默认模式：
 probe 模式：
 
 - 打开浏览器
-- 按 flow 执行受控前置步骤，但 v1 只执行 `goto` 与 `wait_for`
-- `click` 与 `fill` 不执行，只记录 skipped
+- 按 flow 执行受控前置步骤，支持 `goto`、`wait_for` 和受控 `click`
+- confirmed selector 可执行安全 click
+- probe 已唯一命中并写回 confirmed 的 selector 可执行安全 click
+- 第一个 click 支持 limited fallback：`role=button`、`role=link` 或 `text=` 候选唯一命中时可 runtime-confirmed click
+- click 成功后等待页面稳定：优先 `networkidle` 3000ms，失败后 fallback 等待 1000ms
+- `assert_visible` 不执行断言、不终止 flow，只记录 skipped 并继续
+- `fill` 不执行，只记录 skipped
 - fill 缺失 `${test_data_key}` 或对应值为空时直接跳过并记录
 - 每个 flow 只对本 flow steps 中用到的 todo target selector 候选做 Playwright locator `count()` 探测
+- `点击 XXX` 不硬判为 button；候选集至少包含 `role=button[name="XXX"]`、`role=link[name="XXX"]`、`text=XXX`
 - 只有 `count == 1` 时才写入 enriched DSL 并标记 `confirmed`
 
 ## 使用方式
@@ -64,29 +70,77 @@ probe 模式：
 ```bash
 python .codex/skills/dsl-selector-enrichment/scripts/enrich_selectors.py \
   --mode probe \
+  --base-url <page-url> \
+  --reuse-session \
+  --input ./<delivery-name>/ui-dsl/ui-test.dsl.yaml \
+  --output ./<delivery-name>/ui-dsl/ui-test.enriched.dsl.yaml \
+  --report ./<delivery-name>/ui-dsl/selector-enrichment-report.md \
+  --unresolved ./<delivery-name>/ui-dsl/unresolved-selectors.md
+```
+
+probe 全流程探测建议使用 `--reuse-session`。不使用 `--reuse-session` 时，每个 flow 会独立打开 `baseURL`，页面状态不会跨 flow 延续。
+
+移动端 H5 probe 模式：
+
+```bash
+python .codex/skills/dsl-selector-enrichment/scripts/enrich_selectors.py \
+  --mode probe \
+  --base-url <page-url> \
+  --reuse-session \
+  --mobile \
+  --device "iPhone 13" \
+  --geolocation "30.2741,120.1551" \
+  --permissions geolocation \
+  --input ./<delivery-name>/ui-dsl/ui-test.dsl.yaml \
+  --output ./<delivery-name>/ui-dsl/ui-test.enriched.dsl.yaml \
+  --report ./<delivery-name>/ui-dsl/selector-enrichment-report.md \
+  --unresolved ./<delivery-name>/ui-dsl/unresolved-selectors.md
+```
+
+默认是 PC context，不会启用移动端模拟。移动端 H5 页面需要显式传 `--mobile`；定位相关页面需要同时传 `--geolocation` 和 `--permissions geolocation`。`--device` 默认是 `iPhone 13`，`--viewport 390x844` 可覆盖 device viewport。
+
+probe 可选增强：
+
+```bash
+python .codex/skills/dsl-selector-enrichment/scripts/enrich_selectors.py \
+  --mode probe \
+  --base-url <page-url> \
+  --reuse-session \
   --input ./<delivery-name>/ui-dsl/ui-test.dsl.yaml \
   --output ./<delivery-name>/ui-dsl/ui-test.enriched.dsl.yaml \
   --report ./<delivery-name>/ui-dsl/selector-enrichment-report.md \
   --unresolved ./<delivery-name>/ui-dsl/unresolved-selectors.md \
-  --base-url <page-url>
+  --seed-selectors ./seed.yaml \
+  --persist-runtime
 ```
+
+`--seed-selectors` 用于人工锚点，优先级最高。`--reuse-session` 复用同一页面状态执行多个 flow。`--persist-runtime` 会把 runtime-confirmed selector 写回 enriched DSL；默认不写回。第一轮 probe 不建议同时使用 `--persist-runtime`，应在 selector 稳定后再开启。
 
 如果未传 `--input`，脚本会查找 `*/ui-dsl/ui-test.dsl.yaml`。仅找到一个文件时自动使用该文件并把输出写到同级目录；找到多个文件时停止，要求用户指定 delivery-name 或输入路径。
 
 ## probe 安全边界
 
-probe 模式只允许执行：
+probe 模式允许执行：
 
 ```text
 goto
 wait_for
+受控 click
 ```
 
-以下 action 在 probe v1 中不会执行，只会记录为 skipped：
+受控 click 必须满足以下条件之一：
+
+- target selector 已经是 confirmed，例如 seed selector
+- 当前页面 probe 唯一命中并写回 confirmed
+- 当前 flow 的第一个 click 通过 limited fallback 唯一命中 `role=button`、`role=link` 或 `text=` 候选
+
+如果 confirmed selector 在执行前匹配数量不是 1，当前 click 必须跳过并记录 unstable confirmed selector，不能中断整个 flow；后续 step 和 flow 结束后的 selector count 探测仍需继续执行。
+
+以下 action 不会真实执行，只会记录为 skipped：
 
 ```text
-click
 fill
+assert_visible
 ```
 
 其中 `fill` 如果引用 `${test_data_key}` 但 test_data 缺失或值为空，必须直接跳过并在报告中记录原因。
@@ -100,6 +154,12 @@ unsupported_steps
 ```
 
 probe 模式不得执行删除、提交、保存、支付、确认订单、发布、审批、关闭权限或其他改变业务状态的操作。
+
+每次 click 报告必须记录：
+
+- click 前 URL
+- click 后 URL
+- 页面稳定等待方式
 
 ## 更新规则
 

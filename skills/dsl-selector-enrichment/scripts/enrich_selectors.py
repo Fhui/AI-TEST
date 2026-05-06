@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,7 +43,9 @@ UNSAFE_STEP_HINTS = (
     "关闭权限",
 )
 ALLOWED_PROBE_ACTIONS = {"goto", "wait_for"}
-ACTION_WORDS = ("点击", "输入", "填写", "按钮", "提交", "确认")
+ACTION_WORDS = ("未勾选", "勾选", "保持", "点击", "输入", "填写", "按钮", "提交", "确认")
+NOISE_LABELS = {"form element", "page element"}
+RUNTIME_CLICK_STRATEGIES = {"dsl candidate", "role locator", "text locator"}
 
 
 @dataclass
@@ -50,6 +53,8 @@ class Candidate:
     selector: str
     strategy: str
     count: int | None = None
+    visible_count: int | None = None
+    visible_index: int | None = None
     note: str = ""
 
 
@@ -60,6 +65,12 @@ class ProbeEvent:
     action: str
     result: str
     reason: str
+    screenshot: str = ""
+
+
+@dataclass
+class ProbeState:
+    first_click_seen: bool = False
 
 
 @dataclass
@@ -86,6 +97,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report", help="selector-enrichment-report.md 输出路径")
     parser.add_argument("--unresolved", help="unresolved-selectors.md 输出路径")
     parser.add_argument("--base-url", help="probe 模式页面入口 URL")
+    parser.add_argument("--seed-selectors", help="seed selector YAML 文件路径，用于人工锚点覆盖")
+    parser.add_argument("--reuse-session", action="store_true", help="probe 模式复用同一个浏览器页面状态执行多个 flow")
+    parser.add_argument("--persist-runtime", action="store_true", help="将 runtime-confirmed selector 写回 enriched DSL")
+    parser.add_argument("--screenshot", action="store_true", help="是否在 probe 模式记录每个 step 执行后的页面截图")
+    parser.add_argument("--screenshot-dir", help="截图输出目录（默认：<delivery>/playwright/probe-screenshots）")
+    parser.add_argument(
+        "--screenshot-mode",
+        choices=("viewport", "full-page"),
+        default="viewport",
+        help="截图模式，viewport：只截当前视口；full-page：截完整页面",
+    )
+    parser.add_argument("--mobile", action="store_true", help="启用移动端浏览器上下文")
+    parser.add_argument("--device", default="iPhone 13", help="移动端设备名称，仅在 --mobile 时生效，默认：iPhone 13")
+    parser.add_argument("--viewport", help="覆盖浏览器 viewport，格式：390x844")
+    parser.add_argument("--geolocation", help="设置地理位置，格式：30.2741,120.1551")
+    parser.add_argument("--permissions", help="授权权限列表，格式：geolocation,camera")
     parser.add_argument(
         "--mode",
         choices=("dry", "probe"),
@@ -122,6 +149,82 @@ def read_yaml(path: Path) -> dict[str, Any]:
         data = yaml.safe_load(handle)
     if not isinstance(data, dict):
         raise SystemExit("DSL 根节点必须是 mapping。")
+    return data
+
+
+def parse_viewport(value: str | None) -> dict[str, int] | None:
+    if not value:
+        return None
+    match = re.fullmatch(r"\s*(\d+)x(\d+)\s*", value)
+    if not match:
+        raise ValueError("--viewport 格式必须是 WIDTHxHEIGHT，例如：390x844")
+    return {"width": int(match.group(1)), "height": int(match.group(2))}
+
+
+def parse_geolocation(value: str | None) -> dict[str, float] | None:
+    if not value:
+        return None
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != 2:
+        raise ValueError("--geolocation 格式必须是 latitude,longitude，例如：30.2741,120.1551")
+    return {"latitude": float(parts[0]), "longitude": float(parts[1])}
+
+
+def parse_permissions(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def build_context_options(playwright: Any, args: argparse.Namespace) -> dict[str, Any]:
+    if not args.mobile:
+        return {}
+
+    if args.device not in playwright.devices:
+        available = ", ".join(sorted(playwright.devices.keys()))
+        raise ValueError(f"未知 Playwright device：{args.device}。可用 device 包括：{available}")
+
+    context_options = dict(playwright.devices[args.device])
+    viewport = parse_viewport(args.viewport)
+    geolocation = parse_geolocation(args.geolocation)
+    permissions = parse_permissions(args.permissions)
+    if viewport:
+        context_options["viewport"] = viewport
+    if geolocation:
+        context_options["geolocation"] = geolocation
+    if permissions:
+        context_options["permissions"] = permissions
+    context_options["locale"] = "zh-CN"
+    context_options["timezone_id"] = "Asia/Shanghai"
+    return context_options
+
+
+def probe_environment_lines(args: argparse.Namespace) -> list[str]:
+    return [
+        "",
+        "## Probe 环境",
+        "",
+        f"- mobile: {str(bool(getattr(args, 'mobile', False))).lower()}",
+        f"- device: {as_text(getattr(args, 'device', '')) if getattr(args, 'mobile', False) else ''}",
+        f"- viewport: {as_text(getattr(args, 'viewport', ''))}",
+        f"- geolocation: {as_text(getattr(args, 'geolocation', ''))}",
+        f"- permissions: {as_text(getattr(args, 'permissions', ''))}",
+        f"- screenshot-mode: {as_text(getattr(args, 'screenshot_mode', 'viewport'))}",
+    ]
+
+
+def read_optional_yaml(path_text: str | None) -> dict[str, Any]:
+    if not path_text:
+        return {}
+    path = Path(path_text)
+    if not path.exists():
+        raise SystemExit(f"seed selector 文件不存在：{path}")
+    with path.open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle)
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise SystemExit("seed selector 文件根节点必须是 mapping。")
     return data
 
 
@@ -200,7 +303,21 @@ def clean_label(text: str) -> str:
     for word in ACTION_WORDS:
         cleaned = cleaned.replace(word, "")
     cleaned = cleaned.replace("button", "").replace("input", "")
-    return re.sub(r"\s+", " ", cleaned).strip(" :：,，.。")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" :：,，.。")
+    cleaned = re.split(r"[并和且,，]", cleaned)[0].strip()
+    return cleaned
+
+
+def is_noisy_label(label: str) -> bool:
+    normalized = label.strip()
+    lowered = normalized.lower()
+    if re.match(r"^cn[_ ]", lowered):
+        return True
+    if "并" in normalized or len(normalized) > 12:
+        return True
+    if lowered in NOISE_LABELS:
+        return True
+    return False
 
 
 def quoted_fragments(text: str) -> list[str]:
@@ -227,6 +344,26 @@ def label_values(key: str, description: str, source: str) -> list[str]:
     return deduped[:5]
 
 
+def is_placeholder_selector(selector: str, key: str) -> bool:
+    return selector == f'[data-testid="{key}"]' or selector == f"[data-testid='{key}']"
+
+
+def dsl_candidate_values(entry: dict[str, Any]) -> list[str]:
+    raw_candidates = entry.get("candidates", [])
+    if not isinstance(raw_candidates, list):
+        return []
+    values: list[str] = []
+    seen: set[str] = set()
+    for raw_candidate in raw_candidates:
+        if not isinstance(raw_candidate, str):
+            continue
+        candidate = raw_candidate.strip()
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            values.append(candidate)
+    return values
+
+
 def generate_candidates(key: str, entry: dict[str, Any], data: dict[str, Any]) -> tuple[str, str, list[Candidate], bool]:
     description = as_text(entry.get("description"))
     source = as_text(entry.get("source")) or key_usage_context(data, key)
@@ -235,33 +372,53 @@ def generate_candidates(key: str, entry: dict[str, Any], data: dict[str, Any]) -
     labels = label_values(key, description, source)
     candidates: list[Candidate] = []
 
-    def add(selector: str, strategy: str) -> None:
+    def add(selector: str, strategy: str, label: str = "") -> None:
         if selector and all(candidate.selector != selector for candidate in candidates):
-            candidates.append(Candidate(selector=selector, strategy=strategy))
+            note = "noisy label" if label and is_noisy_label(label) else ""
+            candidates.append(Candidate(selector=selector, strategy=strategy, note=note))
 
-    add(current_selector, "原始 selector")
+    for selector in dsl_candidate_values(entry):
+        add(selector, "dsl candidate")
+
+    if candidates:
+        is_unsafe = contains_any(combined, UNSAFE_SELECTOR_HINTS)
+        return description, source, candidates, is_unsafe
+
+    if current_selector and not is_placeholder_selector(current_selector, key):
+        add(current_selector, "原始 selector")
 
     if contains_any(combined, CHECKBOX_HINTS):
         for label in labels:
-            add(f'role=checkbox[name="{label}"]', "role locator")
+            add(f'role=checkbox[name="{label}"]', "role locator", label)
     if contains_any(combined, BUTTON_HINTS):
         for label in labels:
-            add(f'role=button[name="{label}"]', "role locator")
+            add(f'role=button[name="{label}"]', "role locator", label)
+        for label in labels:
+            add(f'role=link[name="{label}"]', "role locator", label)
     if contains_any(combined, INPUT_HINTS):
         for label in labels:
-            add(f"label={label}", "label locator")
+            add(f'role=textbox[name="{label}"]', "role locator", label)
         for label in labels:
-            add(f"placeholder={label}", "placeholder locator")
+            add(f"label={label}", "label locator", label)
+        for label in labels:
+            add(f"placeholder={label}", "placeholder locator", label)
     if contains_any(" ".join((description, source)), TEXT_HINTS) or contains_any(combined, BUTTON_HINTS):
         for label in labels:
-            add(f"text={label}", "text locator")
+            add(f"text={label}", "text locator", label)
+
+    if not any(candidate.selector.startswith("text=") for candidate in candidates):
+        if labels:
+            add(f"text={labels[0]}", "text locator (fallback)", labels[0])
+
+    print(f"[DEBUG] key={key} labels={labels}")
+    print(f"[DEBUG] candidates={[candidate.selector for candidate in candidates]}")
 
     is_unsafe = contains_any(combined, UNSAFE_SELECTOR_HINTS)
     return description, source, candidates, is_unsafe
 
 
 async def locator_count(page: Any, selector: str) -> int:
-    role_match = re.fullmatch(r'role=(button|checkbox)\[name="(.*)"\]', selector)
+    role_match = re.fullmatch(r'role=([A-Za-z0-9_-]+)\[name="(.*)"\]', selector)
     if role_match:
         role, name = role_match.groups()
         return await page.get_by_role(role, name=name).count()
@@ -275,7 +432,7 @@ async def locator_count(page: Any, selector: str) -> int:
 
 
 def locator_for_action(page: Any, selector: str) -> Any:
-    role_match = re.fullmatch(r'role=(button|checkbox)\[name="(.*)"\]', selector)
+    role_match = re.fullmatch(r'role=([A-Za-z0-9_-]+)\[name="(.*)"\]', selector)
     if role_match:
         role, name = role_match.groups()
         return page.get_by_role(role, name=name)
@@ -324,47 +481,328 @@ def flow_target_selector_keys(flow_steps: list[dict[str, Any]], results: dict[st
     return keys
 
 
+def apply_seed_selectors(enriched: dict[str, Any], seed_data: dict[str, Any]) -> list[ProbeEvent]:
+    if not seed_data:
+        return []
+    raw_selectors = seed_data.get("selectors", {})
+    if not isinstance(raw_selectors, dict):
+        raise SystemExit("seed selector 文件中的 selectors 必须是 mapping。")
+
+    if "selectors" not in enriched or not isinstance(enriched.get("selectors"), dict):
+        enriched["selectors"] = {}
+    selectors = enriched["selectors"]
+    events: list[ProbeEvent] = []
+    for key, seed in raw_selectors.items():
+        if not isinstance(seed, dict):
+            continue
+        selector = as_text(seed.get("selector")).strip()
+        status = "confirmed"
+        if not selector:
+            continue
+        if key not in selectors:
+            selectors[str(key)] = {
+                "selector": selector,
+                "description": as_text(seed.get("description")),
+                "source": "seed selector",
+                "status": status,
+                "candidates": [],
+            }
+        else:
+            selectors[str(key)]["selector"] = selector
+            selectors[str(key)]["status"] = status
+            selectors[str(key)].setdefault("candidates", [])
+            if seed.get("description"):
+                selectors[str(key)]["description"] = as_text(seed.get("description"))
+            source = as_text(selectors[str(key)].get("source"))
+            selectors[str(key)]["source"] = f"{source}; seed selector".strip("; ")
+        events.append(ProbeEvent("_seed_", str(key), "seed", "applied", f"使用 seed selector 覆盖：{selector}"))
+    return events
+
+
+def update_enriched_selector(enriched: dict[str, Any], result: SelectorResult, selector: str, status: str = "confirmed") -> None:
+    entry = selector_entries(enriched)[result.key]
+    entry["selector"] = selector
+    entry["status"] = status
+    result.final_selector = selector
+    result.final_status = status
+
+
+def is_runtime_click_candidate(candidate: Candidate) -> bool:
+    selector = candidate.selector
+    return (
+        candidate.strategy in RUNTIME_CLICK_STRATEGIES
+        and (
+            selector.startswith("role=button[")
+            or selector.startswith("role=link[")
+            or selector.startswith("text=")
+        )
+    )
+
+
+async def wait_after_click(page: Any) -> str:
+    try:
+        await page.wait_for_load_state("networkidle", timeout=3000)
+        return "networkidle"
+    except Exception:
+        await page.wait_for_timeout(1000)
+        return "timeout fallback 1000ms"
+
+
+async def perform_stable_click(page: Any, locator: Any, timeout_ms: int) -> tuple[str, str, str]:
+    before_url = page.url
+    await locator.click(timeout=timeout_ms)
+    stable_state = await wait_after_click(page)
+    after_url = page.url
+    return before_url, after_url, stable_state
+
+
+async def visible_locator_info(locator: Any) -> tuple[int, int | None]:
+    count = await locator.count()
+    visible_count = 0
+    first_visible_index: int | None = None
+    for index in range(count):
+        if await locator.nth(index).is_visible():
+            visible_count += 1
+            if first_visible_index is None:
+                first_visible_index = index
+    return visible_count, first_visible_index
+
+
+async def unique_visible_locator(locator: Any) -> tuple[bool, Any | None, str]:
+    count = await locator.count()
+    visible_count, first_visible_index = await visible_locator_info(locator)
+    reason = f"count={count}, visible_count={visible_count}, visible_index={first_visible_index}"
+    if visible_count == 1 and first_visible_index is not None:
+        return True, locator.nth(first_visible_index), reason
+    return False, None, reason
+
+
+def safe_filename_part(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    return cleaned.strip("_") or "unknown"
+
+
+async def maybe_screenshot(page: Any, flow_id: str, step_id: str, action: str, args: argparse.Namespace) -> str:
+    if not getattr(args, "screenshot", False):
+        return ""
+    base_dir = Path(args.screenshot_dir) if getattr(args, "screenshot_dir", None) else Path("./playwright/probe-screenshots")
+    flow_dir = base_dir / safe_filename_part(flow_id)
+    flow_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{safe_filename_part(step_id)}_{safe_filename_part(action)}.png"
+    path = flow_dir / filename
+    try:
+        await page.screenshot(path=str(path), full_page=args.screenshot_mode == "full-page")
+        return str(path)
+    except Exception as exc:  # noqa: BLE001 - 截图失败不能影响 probe 行为
+        return f"screenshot failed: {exc}"
+
+
+async def make_probe_event(
+    page: Any,
+    flow_id: str,
+    step_id: str,
+    action: str,
+    result: str,
+    reason: str,
+    args: argparse.Namespace,
+) -> ProbeEvent:
+    screenshot = await maybe_screenshot(page, flow_id, step_id, action, args)
+    return ProbeEvent(flow_id, step_id, action, result, reason, screenshot=screenshot)
+
+
+async def probe_result_on_page(
+    page: Any,
+    result: SelectorResult,
+    enriched: dict[str, Any],
+    flow_id: str,
+    *,
+    write_back: bool,
+    runtime_only: bool = False,
+) -> Candidate | None:
+    if result.reason.startswith("安全策略"):
+        return None
+    result.probed = True
+    for candidate in result.candidates:
+        if runtime_only and not is_runtime_click_candidate(candidate):
+            continue
+        try:
+            locator = locator_for_action(page, candidate.selector)
+            candidate.count = await locator.count()
+            candidate.visible_count, candidate.visible_index = await visible_locator_info(locator)
+            print(
+                f"[VISIBLE] selector={candidate.selector} "
+                f"count={candidate.count} "
+                f"visible={candidate.visible_count}"
+            )
+            visibility_note = (
+                f"flow={flow_id} count={candidate.count} "
+                f"visible_count={candidate.visible_count} "
+                f"visible_index={candidate.visible_index}"
+            )
+            candidate.note = f"{candidate.note}; {visibility_note}".strip("; ")
+        except Exception as exc:  # noqa: BLE001 - 单个 locator 失败不影响其他候选
+            candidate.count = -1
+            candidate.visible_count = None
+            candidate.visible_index = None
+            candidate.note = f"locator 探测失败：{exc}"
+
+    unique = [
+        candidate
+        for candidate in result.candidates
+        if candidate.visible_count == 1 and (not runtime_only or is_runtime_click_candidate(candidate))
+    ]
+    if not unique:
+        return None
+
+    selected = unique[0]
+    if write_back:
+        update_enriched_selector(enriched, result, selected.selector)
+        result.result = "confirmed"
+        result.reason = f"在 flow={flow_id} 中唯一匹配，选择候选：{selected.selector}"
+        result.strategy = selected.strategy
+        result.flow_id = flow_id
+    return selected
+
+
 async def execute_probe_step(
     page: Any,
     step: dict[str, Any],
-    selectors: dict[str, dict[str, Any]],
+    enriched: dict[str, Any],
+    results: dict[str, SelectorResult],
     base_url: str,
     data_values: dict[str, str],
+    state: ProbeState,
+    flow_id: str,
+    persist_runtime: bool,
+    args: argparse.Namespace,
 ) -> ProbeEvent:
+    selectors = selector_entries(enriched)
     action = as_text(step.get("action")).lower()
     step_id = as_text(step.get("id")) or "_unknown_step_"
     target = as_text(step.get("target"))
     timeout_ms = int(step.get("timeout_ms") or 5000)
 
+    if action == "assert_visible":
+        return await make_probe_event(page, flow_id, step_id, action, "skipped", "assert step skipped but flow continues", args)
+
     if contains_any(step_text(step, selectors), UNSAFE_SELECTOR_HINTS):
-        return ProbeEvent("", step_id, action, "abort", "遇到验证码、滑块、极验或手动验证步骤，中断当前 flow 探测。")
+        return await make_probe_event(page, flow_id, step_id, action, "abort", "遇到验证码、滑块、极验或手动验证步骤，中断当前 flow 探测。", args)
     if contains_any(step_text(step, selectors), UNSAFE_STEP_HINTS):
-        return ProbeEvent("", step_id, action, "abort", "遇到可能改变业务状态的危险步骤，中断当前 flow 探测。")
+        return await make_probe_event(page, flow_id, step_id, action, "abort", "遇到可能改变业务状态的危险步骤，中断当前 flow 探测。", args)
 
     if action == "click":
-        return ProbeEvent("", step_id, action, "skipped", "probe v1 不执行 click，仅允许 goto / wait_for。")
+        is_first_click = not state.first_click_seen
+        if not target:
+            return await make_probe_event(page, flow_id, step_id, action, "skipped", "click 步骤没有 target，已跳过。", args)
+        if selector_status(selectors, target) == "confirmed":
+            locator = locator_for_action(page, selector_string(selectors, target))
+            ok, visible_locator, visibility_reason = await unique_visible_locator(locator)
+            if not ok or visible_locator is None:
+                return await make_probe_event(
+                    page,
+                    flow_id,
+                    step_id,
+                    action,
+                    "skipped",
+                    f"unstable confirmed selector：{visibility_reason}，可见元素不是唯一匹配，已跳过当前 step，继续后续探测。",
+                    args,
+                )
+            before_url, after_url, stable_state = await perform_stable_click(page, visible_locator, timeout_ms)
+            state.first_click_seen = True
+            return await make_probe_event(
+                page,
+                flow_id,
+                step_id,
+                action,
+                "executed",
+                f"safe click using confirmed selector: {selector_string(selectors, target)}; {visibility_reason}; before_url={before_url}; after_url={after_url}; stable={stable_state}",
+                args,
+            )
+
+        result = results.get(target)
+        if result and is_first_click:
+            runtime_candidate = await probe_result_on_page(
+                page,
+                result,
+                enriched,
+                flow_id,
+                write_back=False,
+                runtime_only=True,
+            )
+            if runtime_candidate:
+                if persist_runtime:
+                    update_enriched_selector(enriched, result, runtime_candidate.selector)
+                    result.result = "confirmed"
+                    result.reason = f"runtime-confirmed 持久化：{runtime_candidate.selector}"
+                    result.strategy = runtime_candidate.strategy
+                    result.flow_id = flow_id
+                before_url, after_url, stable_state = await perform_stable_click(
+                    page,
+                    locator_for_action(page, runtime_candidate.selector).nth(runtime_candidate.visible_index or 0),
+                    timeout_ms,
+                )
+                state.first_click_seen = True
+                persist_note = " persisted" if persist_runtime else ""
+                return await make_probe_event(
+                    page,
+                    flow_id,
+                    step_id,
+                    action,
+                    "runtime-confirmed",
+                    f"runtime-confirmed{persist_note} click using {runtime_candidate.selector}; count={runtime_candidate.count}; visible_count={runtime_candidate.visible_count}; visible_index={runtime_candidate.visible_index}; before_url={before_url}; after_url={after_url}; stable={stable_state}",
+                    args,
+                )
+
+        if result:
+            selected = await probe_result_on_page(page, result, enriched, flow_id, write_back=True)
+            if selected:
+                locator = locator_for_action(page, selected.selector)
+                ok, visible_locator, visibility_reason = await unique_visible_locator(locator)
+                if not ok or visible_locator is None:
+                    return await make_probe_event(
+                        page,
+                        flow_id,
+                        step_id,
+                        action,
+                        "skipped",
+                        f"unstable probe confirmed selector：{visibility_reason}，可见元素不是唯一匹配，已跳过当前 step，继续后续探测。",
+                        args,
+                    )
+                before_url, after_url, stable_state = await perform_stable_click(page, visible_locator, timeout_ms)
+                state.first_click_seen = True
+                return await make_probe_event(
+                    page,
+                    flow_id,
+                    step_id,
+                    action,
+                    "executed",
+                    f"safe click using probe confirmed selector: {selected.selector}; {visibility_reason}; before_url={before_url}; after_url={after_url}; stable={stable_state}",
+                    args,
+                )
+
+        return await make_probe_event(page, flow_id, step_id, action, "skipped", "target selector 未 confirmed，禁止模糊 click。", args)
     if action == "fill":
         value = as_text(step.get("value"))
         ref = test_data_reference(value)
         if ref and (ref not in data_values or data_values.get(ref) == ""):
-            return ProbeEvent("", step_id, action, "skipped", f"fill 依赖的 test_data 缺失或为空：{ref}，已跳过。")
-        return ProbeEvent("", step_id, action, "skipped", "probe v1 不执行 fill，仅记录跳过。")
+            return await make_probe_event(page, flow_id, step_id, action, "skipped", f"fill 依赖的 test_data 缺失或为空：{ref}，已跳过。", args)
+        return await make_probe_event(page, flow_id, step_id, action, "skipped", "probe v1 不执行 fill，仅记录跳过。", args)
 
     if action not in ALLOWED_PROBE_ACTIONS:
-        return ProbeEvent("", step_id, action, "abort", f"不支持的 probe action：{action}")
+        return await make_probe_event(page, flow_id, step_id, action, "abort", f"不支持的 probe action：{action}", args)
 
     if action == "goto":
         await page.goto(resolve_url(base_url, as_text(step.get("url"))), wait_until="domcontentloaded", timeout=timeout_ms)
-        return ProbeEvent("", step_id, action, "executed", "已打开页面。")
+        return await make_probe_event(page, flow_id, step_id, action, "executed", "已打开页面。", args)
 
     if action == "wait_for":
         if target and selector_status(selectors, target) == "confirmed":
             await locator_for_action(page, selector_string(selectors, target)).wait_for(timeout=timeout_ms)
-            return ProbeEvent("", step_id, action, "executed", "已等待 confirmed selector 出现。")
+            return await make_probe_event(page, flow_id, step_id, action, "executed", "已等待 confirmed selector 出现。", args)
         await page.wait_for_timeout(min(timeout_ms, 5000))
-        return ProbeEvent("", step_id, action, "executed", "未提供 confirmed selector，按 timeout 做受控等待。")
+        return await make_probe_event(page, flow_id, step_id, action, "executed", "未提供 confirmed selector，按 timeout 做受控等待。", args)
 
-    return ProbeEvent("", step_id, action, "skipped", "步骤未执行。")
+    return await make_probe_event(page, flow_id, step_id, action, "skipped", "步骤未执行。", args)
 
 
 async def probe_selector_results(
@@ -372,26 +810,34 @@ async def probe_selector_results(
     enriched: dict[str, Any],
     results: dict[str, SelectorResult],
     base_url: str,
+    reuse_session: bool,
+    seed_events: list[ProbeEvent],
+    persist_runtime: bool,
+    args: argparse.Namespace,
 ) -> tuple[str, list[ProbeEvent]]:
     try:
         from playwright.async_api import async_playwright
     except ImportError:
         return "未安装 Playwright Python 包。", []
 
-    events: list[ProbeEvent] = []
+    events: list[ProbeEvent] = list(seed_events)
     data_values = test_data_values(data)
 
     try:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
+            context_options = build_context_options(playwright, args)
+            context = await browser.new_context(**context_options)
             source_flows = flows(data) or [{"id": "_default_", "steps": [{"id": "goto_base", "action": "goto", "url": ""}]}]
+            shared_page = await context.new_page() if reuse_session else None
             for flow in source_flows:
                 flow_id = as_text(flow.get("id")) or "_unknown_flow_"
-                page = await browser.new_page()
+                page = shared_page or await context.new_page()
+                state = ProbeState()
                 try:
                     flow_steps = [step for step in flow.get("steps", []) if isinstance(step, dict)]
                     first_action = as_text(flow_steps[0].get("action")).lower() if flow_steps else ""
-                    if not flow_steps or first_action != "goto":
+                    if (not reuse_session and not flow_steps) or first_action != "goto":
                         await page.goto(base_url, wait_until="domcontentloaded", timeout=30000)
                     target_keys = flow_target_selector_keys(flow_steps, results)
                     if not target_keys:
@@ -401,9 +847,14 @@ async def probe_selector_results(
                         event = await execute_probe_step(
                             page,
                             step,
-                            selector_entries(enriched),
+                            enriched,
+                            results,
                             base_url,
                             data_values,
+                            state,
+                            flow_id,
+                            persist_runtime,
+                            args,
                         )
                         event.flow_id = flow_id
                         events.append(event)
@@ -412,16 +863,20 @@ async def probe_selector_results(
                             break
                     if aborted:
                         continue
-                    await probe_counts_on_page(page, results, flow_id, target_keys)
+                    await probe_counts_on_page(page, results, enriched, flow_id, target_keys)
                 finally:
-                    await page.close()
+                    if not reuse_session:
+                        await page.close()
+            if shared_page:
+                await shared_page.close()
+            await context.close()
             await browser.close()
     except Exception as exc:  # noqa: BLE001 - 记录探测失败，不覆盖原始 DSL
         return f"probe 探测失败：{exc}", events
     return "", events
 
 
-async def probe_counts_on_page(page: Any, results: dict[str, SelectorResult], flow_id: str, target_keys: set[str]) -> None:
+async def probe_counts_on_page(page: Any, results: dict[str, SelectorResult], enriched: dict[str, Any], flow_id: str, target_keys: set[str]) -> None:
     try:
         await page.wait_for_load_state("networkidle", timeout=5000)
     except Exception:
@@ -431,30 +886,7 @@ async def probe_counts_on_page(page: Any, results: dict[str, SelectorResult], fl
             continue
         if result.final_status.lower() == "confirmed" or result.reason.startswith("安全策略"):
             continue
-        result.probed = True
-        for candidate in result.candidates:
-            if candidate.count == 1:
-                continue
-            try:
-                count = await locator_count(page, candidate.selector)
-                if candidate.count is None or count == 1:
-                    candidate.count = count
-                    candidate.note = f"flow={flow_id}"
-                elif count > 0:
-                    candidate.note = f"{candidate.note}; flow={flow_id} count={count}".strip("; ")
-            except Exception as exc:  # noqa: BLE001 - 单个 locator 失败不影响其他候选
-                candidate.count = -1
-                candidate.note = f"locator 探测失败：{exc}"
-
-        unique = [candidate for candidate in result.candidates if candidate.count == 1]
-        if unique:
-            selected = unique[0]
-            result.final_selector = selected.selector
-            result.final_status = "confirmed"
-            result.result = "confirmed"
-            result.reason = f"在 flow={flow_id} 中唯一匹配，选择候选：{selected.selector}"
-            result.strategy = selected.strategy
-            result.flow_id = flow_id
+        await probe_result_on_page(page, result, enriched, flow_id, write_back=True)
 
 
 def apply_results(enriched: dict[str, Any], results: dict[str, SelectorResult], mode: str, probe_error: str) -> None:
@@ -475,8 +907,8 @@ def apply_results(enriched: dict[str, Any], results: dict[str, SelectorResult], 
             result.reason = "未生成候选 locator。"
         elif mode == "probe" and not result.probed:
             result.reason = "probe 模式仅探测每个 flow steps 中使用到的 target selector；该 selector 未被可完成前置探测的 flow 覆盖。"
-        elif any(candidate.count and candidate.count > 1 for candidate in result.candidates):
-            result.reason = "候选 locator 存在匹配但不唯一。"
+        elif any(candidate.visible_count and candidate.visible_count > 1 for candidate in result.candidates):
+            result.reason = "候选 locator 存在可见匹配但不唯一。"
         else:
             result.reason = "候选 locator 未匹配到页面元素。"
 
@@ -512,6 +944,18 @@ def display_result(value: str) -> str:
     return {"unchanged": "保持 todo", "confirmed": "已补全"}.get(value, value)
 
 
+def screenshot_markdown(screenshot: str, report_path: Path) -> str:
+    if not screenshot:
+        return ""
+    if screenshot.startswith("screenshot failed:"):
+        return markdown_escape(screenshot)
+    try:
+        relative_path = os.path.relpath(screenshot, report_path.parent)
+    except ValueError:
+        relative_path = screenshot
+    return f"![screenshot]({relative_path})"
+
+
 def write_report(
     path: Path,
     original_selectors: dict[str, dict[str, Any]],
@@ -520,6 +964,7 @@ def write_report(
     events: list[ProbeEvent],
     mode: str,
     probe_error: str,
+    args: argparse.Namespace,
 ) -> None:
     total = len(original_selectors)
     todo_total = sum(1 for entry in original_selectors.values() if as_text(entry.get("status")).lower() == "todo")
@@ -543,15 +988,31 @@ def write_report(
     ]
     if probe_error:
         lines.append(f"- probe 全局错误：{probe_error}")
+    lines.extend(probe_environment_lines(args))
     lines.extend(["", "## 受控探测执行记录", ""])
     if events:
-        lines.extend(["| flow | step | action | 结果 | 原因 |", "| --- | --- | --- | --- | --- |"])
+        lines.extend(["| flow | step | action | 结果 | 原因 | 截图 |", "| --- | --- | --- | --- | --- | --- |"])
         for event in events:
             lines.append(
-                f"| {markdown_escape(event.flow_id)} | {markdown_escape(event.step_id)} | {markdown_escape(event.action)} | {markdown_escape(event.result)} | {markdown_escape(event.reason)} |"
+                f"| {markdown_escape(event.flow_id)} | {markdown_escape(event.step_id)} | {markdown_escape(event.action)} | {markdown_escape(event.result)} | {markdown_escape(event.reason)} | {screenshot_markdown(event.screenshot, path)} |"
             )
     else:
         lines.append("无受控探测执行记录。")
+
+    runtime_events = [
+        event
+        for event in events
+        if event.action in {"seed", "goto", "click"} or event.result in {"runtime-confirmed", "executed"}
+    ]
+    lines.extend(["", "## runtime 行为", ""])
+    if runtime_events:
+        lines.extend(["| flow | step | 行为 | 结果 | 路径/selector | 截图 |", "| --- | --- | --- | --- | --- | --- |"])
+        for event in runtime_events:
+            lines.append(
+                f"| {markdown_escape(event.flow_id)} | {markdown_escape(event.step_id)} | {markdown_escape(event.action)} | {markdown_escape(event.result)} | {markdown_escape(event.reason)} | {screenshot_markdown(event.screenshot, path)} |"
+            )
+    else:
+        lines.append("无 runtime click、seed selector 或进入路径记录。")
 
     lines.extend(["", "## selector 处理明细", ""])
     for result in results.values():
@@ -566,17 +1027,19 @@ def write_report(
                 f"- 使用策略：{result.strategy or '_未确认_'}",
                 f"- 命中 flow：{result.flow_id or '_无_'}",
                 "",
-                "| 候选 locator | 策略 | count | 备注 |",
-                "| --- | --- | ---: | --- |",
+                "| 候选 locator | 策略 | count | visible_count | visible_index | 备注 |",
+                "| --- | --- | ---: | ---: | ---: | --- |",
             ]
         )
         for candidate in result.candidates:
             count = "" if candidate.count is None else str(candidate.count)
+            visible_count = "" if candidate.visible_count is None else str(candidate.visible_count)
+            visible_index = "" if candidate.visible_index is None else str(candidate.visible_index)
             lines.append(
-                f"| `{markdown_escape(candidate.selector)}` | {markdown_escape(candidate.strategy)} | {count} | {markdown_escape(candidate.note)} |"
+                f"| `{markdown_escape(candidate.selector)}` | {markdown_escape(candidate.strategy)} | {count} | {visible_count} | {visible_index} | {markdown_escape(candidate.note)} |"
             )
         if not result.candidates:
-            lines.append("| _无_ |  |  |  |")
+            lines.append("| _无_ |  |  |  |  |  |")
         lines.append("")
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -612,14 +1075,28 @@ async def async_main() -> int:
         raise SystemExit("probe 模式必须传入 --base-url。")
 
     input_path, output_path, report_path, unresolved_path = resolve_paths(args)
+    if args.screenshot and not args.screenshot_dir:
+        args.screenshot_dir = str(input_path.parent.parent / "playwright" / "probe-screenshots")
     data = read_yaml(input_path)
     enriched = copy.deepcopy(data)
-    results = build_selector_results(data)
+    seed_events = apply_seed_selectors(enriched, read_optional_yaml(args.seed_selectors))
+    results = build_selector_results(enriched)
     events: list[ProbeEvent] = []
     probe_error = ""
 
     if args.mode == "probe" and results:
-        probe_error, events = await probe_selector_results(data, enriched, results, args.base_url)
+        probe_error, events = await probe_selector_results(
+            data,
+            enriched,
+            results,
+            args.base_url,
+            args.reuse_session,
+            seed_events,
+            args.persist_runtime,
+            args,
+        )
+    elif seed_events:
+        events = seed_events
 
     apply_results(enriched, results, args.mode, probe_error)
     write_yaml(output_path, enriched)
@@ -631,6 +1108,7 @@ async def async_main() -> int:
         events,
         args.mode,
         probe_error,
+        args,
     )
     write_unresolved(unresolved_path, results)
 

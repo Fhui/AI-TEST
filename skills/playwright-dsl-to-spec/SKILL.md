@@ -1,6 +1,6 @@
 ---
 name: playwright-dsl-to-spec
-description: 将符合 .codex/skills/testcase-to-playwright-dsl/references/dsl-schema.md 的 ui-test.dsl.yaml 转换为 Playwright spec.ts。适用于 Codex 读取 ./<delivery-name>/ui-dsl/ui-test.dsl.yaml 并生成 ./<delivery-name>/playwright/tests/*.spec.ts；严格按 DSL schema 解析字段，不新增 DSL 字段，不修改 testcase-to-playwright-dsl skill，不执行 Playwright，不运行 npx playwright test。
+description: 将符合 .codex/skills/testcase-to-playwright-dsl/references/dsl-schema.md 的 ui-test.dsl.yaml 转换为 Playwright spec.ts。适用于 Codex 读取交付目录中的 ui-dsl/ui-test.dsl.yaml 并生成 playwright/tests/*.spec.ts；严格按 DSL schema 解析字段，不新增 DSL 字段，不修改 testcase-to-playwright-dsl skill，不执行 Playwright，不运行 npx playwright test。
 ---
 
 # Playwright DSL 转 Spec
@@ -35,7 +35,7 @@ python3 .codex/skills/playwright-dsl-to-spec/scripts/convert_dsl_to_spec.py \
 
 - 只支持 schema 中定义的 action：`goto`、`click`、`fill`、`select`、`upload`、`wait_for`、`assert_visible`、`assert_text`、`assert_state`。
 - 严格校验顶层字段、`meta`、`selectors`、`test_data`、`flows`、`steps`、`todos`、`unsupported_steps` 的字段白名单；出现 schema 外字段时停止。
-- `selector.status: "todo"` 的步骤不要生成真实 Playwright 操作，只生成 TODO 注释。
+- `selector.status: "todo"` 的步骤不要生成真实 Playwright 操作，必须生成清晰的运行时失败或跳过，不能只生成 TODO 注释后静默通过。默认生成 `throw new Error(...)`。
 - `selector.status: "confirmed"` 的步骤才生成真实 Playwright locator 操作。
 - `goto` 仅在 `url` 非空时生成 `page.goto(url)`；否则生成 TODO 注释。
 - `wait_for` 如果没有 target，则生成 `page.waitForTimeout(timeout_ms)`；如果有 target，遵循 selector status 规则。
@@ -43,7 +43,16 @@ python3 .codex/skills/playwright-dsl-to-spec/scripts/convert_dsl_to_spec.py \
 - `assert_visible` 使用 `toBeVisible`。
 - `assert_text` 使用 `toContainText(expected)`；缺少 `expected` 时生成 TODO 注释。
 - `assert_state` 使用 `toBeVisible` 作为保守状态断言，并保留 `expected` 为 TODO 注释，等待人工补充具体状态断言。
+- confirmed selector 字符串要转换为对应 Playwright locator API：`role=...` 使用 `page.getByRole`，`label=` 使用 `page.getByLabel`，`placeholder=` 使用 `page.getByPlaceholder`，`text=` 使用 `page.getByText`，CSS selector 使用 `page.locator`。
 - `optional: true` 的步骤包裹在 `try/catch` 中，失败时记录 warning，不中断测试。
+- 每个 DSL step 前必须固定输出以下四行注释，供 `playwright-result-report` 从失败行号反查 DSL：
+
+```ts
+// flow_id: <flow.id>
+// step_id: <step.id>
+// source_ts: <step.source_ts>
+// selector_key: <step.target>
+```
 
 ## 输出约定
 

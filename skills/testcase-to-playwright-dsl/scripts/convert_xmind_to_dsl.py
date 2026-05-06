@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import re
 from pathlib import Path
 from typing import Any
@@ -28,17 +29,17 @@ ALLOWED_ACTIONS = {
 
 ACTION_KEYWORDS: list[tuple[str, str]] = [
     ("下拉选择", "select"),
-    ("打开", "goto"),
-    ("进入", "goto"),
-    ("访问", "goto"),
-    ("跳转", "goto"),
     ("点击", "click"),
+    ("提交", "click"),
+    ("确认", "click"),
     ("选择", "click"),
     ("勾选", "click"),
+    ("选中", "click"),
     ("输入", "fill"),
     ("填写", "fill"),
     ("上传", "upload"),
     ("等待", "wait_for"),
+    ("显示", "assert_text"),
     ("查看", "assert_visible"),
     ("校验可见", "assert_visible"),
     ("校验文案", "assert_text"),
@@ -66,8 +67,37 @@ UI_HINTS: list[tuple[str, str]] = [
     ("链接", "link"),
 ]
 
+ACTION_CLEANUP_WORDS = ["点击", "输入", "填写", "选择", "勾选", "查看", "显示", "选中", "上传"]
 ACTION_INTENT_WORDS = ["点击", "提交", "确认", "输入", "填写", "勾选", "选中", "选择", "上传", "搜索", "查询"]
 FIELD_CONNECTORS = ["和", "并", "同时", "以及", "、"]
+COMPOUND_CONNECTOR_PATTERN = r"(?:和|并|同时|以及|、)"
+GENERIC_SEMANTIC_TERMS: list[tuple[str, str]] = [
+    ("某入口", "entry"),
+    ("入口", "entry"),
+    ("某字段", "field"),
+    ("字段", "field"),
+    ("某选项", "option"),
+    ("选项", "option"),
+    ("协议", "agreement"),
+    ("确认", "confirm"),
+    ("提交", "submit"),
+    ("取消", "cancel"),
+    ("保存", "save"),
+    ("文件", "file"),
+    ("图片", "image"),
+    ("文案", "text"),
+    ("提示", "message"),
+    ("内容", "content"),
+    ("表单", "form"),
+    ("页面", "page"),
+    ("入口", "entry"),
+    ("按钮", "button"),
+    ("列表", "list"),
+    ("表格", "table"),
+    ("弹窗", "modal"),
+    ("菜单", "menu"),
+    ("链接", "link"),
+]
 
 NON_CASE_SECTIONS = {
     "待确认项",
@@ -181,72 +211,138 @@ def is_expected_label(text: str) -> bool:
 
 
 def slugify(text: str, fallback: str) -> str:
-    replacements = {
-        "登录": "login",
-        "权限": "permission",
-        "课程": "course",
-        "导入": "import",
-        "删除": "delete",
-        "确认": "confirm",
-        "搜索": "search",
-        "查询": "query",
-        "保存": "save",
-        "提交": "submit",
-        "取消": "cancel",
-        "列表": "list",
-        "表格": "table",
-        "弹窗": "modal",
-        "按钮": "button",
-        "输入框": "input",
-        "名称": "name",
-        "账号": "account",
-        "密码": "password",
-        "首页": "home",
-        "页面": "page",
-    }
     result = text
-    for zh, en in replacements.items():
+    for zh, en in GENERIC_SEMANTIC_TERMS:
         result = result.replace(zh, f" {en} ")
     result = re.sub(r"https?://\S+", " url ", result)
     result = re.sub(r"[^A-Za-z0-9]+", "_", result).strip("_").lower()
     result = re.sub(r"_+", "_", result)
     if not result:
-        result = fallback
+        hash_hex = hashlib.md5(text.encode("utf-8")).hexdigest()[:8]
+        result = f"cn_{hash_hex}"
     if re.match(r"^\d", result):
         result = f"{fallback}_{result}"
     return result[:64].strip("_") or fallback
 
 
 def action_for(text: str) -> str | None:
+    if re.search(r"(?:打开|访问)\s*https?://\S+", text):
+        return "goto"
     for keyword, action in ACTION_KEYWORDS:
         if keyword in text:
             return action
     return None
 
 
-def selector_key_for(text: str, action: str, index: int) -> str:
-    source = text
-    for keyword, _action in ACTION_KEYWORDS:
-        source = source.replace(keyword, " ")
-    suffix = ""
-    for hint, mapped in UI_HINTS:
-        if hint in text:
-            suffix = mapped
-            source = source.replace(hint, " ")
-            break
-    base = slugify(source, f"element_{index:03d}")
+def action_type_suffix(action: str, text: str) -> str:
+    compact = _compact_text(text)
+    if action == "fill":
+        return "input"
+    if action == "select":
+        return "select"
+    if action == "upload":
+        return "upload"
+    if action == "click" and re.search(r"(?:勾选|选中|复选框|checkbox)", compact, re.I):
+        return "checkbox"
+    if action == "click":
+        return "button"
     if action == "goto":
-        suffix = suffix or "page"
-    elif action in {"click", "assert_visible"}:
-        suffix = suffix or "element"
-    elif action == "fill":
-        suffix = suffix or "input"
-    elif action == "select":
-        suffix = suffix or "select"
-    elif action == "upload":
-        suffix = suffix or "upload"
-    key = f"{base}_{suffix}" if suffix and not base.endswith(f"_{suffix}") else base
+        return "page"
+    return "element"
+
+
+def semantic_text_for(text: str, action: str) -> str:
+    source = strip_md(text)
+    source = re.sub(r"https?://\S+", " ", source)
+    source = re.sub(r"^\s*(?:ts|TS|步骤|操作步骤|测试步骤)\s*[:：,，]\s*", "", source)
+    for keyword in ACTION_CLEANUP_WORDS:
+        source = source.replace(keyword, " ")
+    source = re.sub(r"(?:按钮|输入框|文本框|复选框|下拉框|单选框)$", " ", source)
+    source = re.sub(r"[\"'“”‘’\[\]【】()（）<>《》，,。.:：；;、]", " ", source)
+    source = re.sub(r"\s+", " ", source).strip()
+    if not source and action == "upload":
+        return "file"
+    return source
+
+
+def selector_key_for(text: str, action: str, index: int) -> str:
+    suffix = action_type_suffix(action, text)
+    source = semantic_text_for(text, action)
+    for hint, mapped in UI_HINTS:
+        if hint in source and mapped == suffix:
+            source = source.replace(hint, " ")
+    base = slugify(source, f"element_{index:03d}")
+    if suffix:
+        if base == suffix or base.endswith(f"_{suffix}"):
+            key = base
+        else:
+            key = f"{base}_{suffix}"
+    else:
+        key = base
     return re.sub(r"_+", "_", key).strip("_")
+
+
+def dedupe_keep_order(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        value = value.strip()
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
+def candidate_labels(text: str, action: str) -> list[str]:
+    labels: list[str] = []
+    quoted = extract_quoted_text(text)
+    if quoted:
+        labels.append(quoted)
+    semantic = semantic_text_for(text, action)
+    first_atom = re.split(COMPOUND_CONNECTOR_PATTERN, semantic, maxsplit=1)[0]
+    first_atom = re.sub(r"^(?:进入|打开|访问|跳转|提交|确认)", "", first_atom)
+    first_atom = first_atom.strip(" \"'“”‘’[]【】()（）<>《》，,。.:：；;、")
+    if first_atom and not re.fullmatch(r"cn_[0-9a-f]{8}", first_atom):
+        labels.append(first_atom)
+    return dedupe_keep_order(labels)
+
+
+def selector_candidates_for(text: str, action: str) -> list[str]:
+    candidates: list[str] = []
+    labels = candidate_labels(text, action)
+    combined = _compact_text(text) + "".join(labels)
+    is_checkbox = bool(re.search(r"(?:勾选|选中|协议|同意|复选框|checkbox)", combined, re.I))
+
+    for label in labels:
+        if action == "click":
+            if is_checkbox:
+                candidates.extend([
+                    f'role=checkbox[name="{label}"]',
+                    f"text={label}",
+                ])
+            else:
+                candidates.extend([
+                    f'role=button[name="{label}"]',
+                    f'role=link[name="{label}"]',
+                    f"text={label}",
+                ])
+        elif action == "fill":
+            candidates.extend([
+                f"label={label}",
+                f"placeholder={label}",
+                f'role=textbox[name="{label}"]',
+            ])
+        elif action in {"assert_text", "assert_visible"}:
+            candidates.append(f"text={label}")
+        elif action == "select":
+            candidates.extend([
+                f"label={label}",
+                f'role=combobox[name="{label}"]',
+            ])
+        elif action == "upload":
+            candidates.append(f"label={label}")
+
+    return dedupe_keep_order(candidates)
 
 
 def _compact_text(text: str) -> str:
@@ -307,31 +403,84 @@ def is_text_assertion(text: str) -> tuple[bool, str]:
     if not re.match(r"^(?:显示|提示|看到|校验文案)", compact):
         return (False, "")
     quoted = extract_quoted_text(text)
-    return (bool(quoted), quoted or "")
+    if quoted:
+        return (True, quoted)
+    match = re.match(r"^(?:显示|提示|看到|校验文案)(.+)$", compact)
+    if not match:
+        return (False, "")
+    candidate = _clean_locator_name(match.group(1))
+    if not candidate:
+        return (False, "")
+    if any(keyword in candidate for keyword in ["页面", "状态", "已输入", "加载完成", "PRD", "规则", "未说明"]):
+        return (False, "")
+    return (True, candidate)
 
 
 def is_page_state(text: str) -> bool:
     compact = _compact_text(text)
-    if re.match(r"^(?:打开|启动|进入)应用$", compact):
+    if re.search(r"(?:页面加载完成|加载完成|字段展示已输入状态|PRD未说明|规则未说明)", compact):
         return True
-    if re.match(r"^(?:进入|展示).*(?:页面)$", compact):
+    if re.search(r"(?:页面|状态|流程|表单).*(?:展示|进入|变更|完成|成功|失败)", compact):
         return True
-    if any(keyword in compact for keyword in ["状态已", "登录成功", "查看数据", "检查结果", "显示结果", "看到列表", "展示页面"]):
+    if re.search(r"(?:展示|进入).*(?:页面|表单|流程)", compact):
         return True
     return False
 
 
-def is_compound_action(text: str) -> bool:
+def is_compound_navigation(text: str) -> bool:
     compact = _compact_text(text)
-    action_count = sum(len(re.findall(re.escape(word), compact)) for word in ACTION_INTENT_WORDS)
-    has_connector = any(connector in compact for connector in FIELD_CONNECTORS)
-    if action_count >= 2 and has_connector:
+    return bool(re.match(r"^进入.+(?:页面|表单|流程)$", compact))
+
+
+def compound_action_parts(text: str) -> list[tuple[str, str]]:
+    compact = _compact_text(text)
+    if is_compound_navigation(text):
+        return []
+
+    match = re.match(rf"^(输入|填写)(.+?){COMPOUND_CONNECTOR_PATTERN}(.+)$", compact)
+    if match:
+        left, right = match.group(2), match.group(3)
+        right_action = action_for(right)
+        if right_action in {"click", "fill", "select", "upload"}:
+            right_part = right
+        else:
+            right_action = "fill"
+            right_part = re.sub(r"^(?:输入|填写)", "", right)
+        return [("fill", left), (right_action, right_part)] if left and right_part else []
+
+    parts: list[tuple[str, str]] = []
+    tokens = re.split(COMPOUND_CONNECTOR_PATTERN, compact)
+    for token in tokens:
+        if not token:
+            continue
+        action = action_for(token)
+        if action in {"click", "fill", "select", "upload"}:
+            for keyword, mapped_action in ACTION_KEYWORDS:
+                if mapped_action == action and keyword in token:
+                    label = token.replace(keyword, "", 1)
+                    if label or keyword in {"提交", "确认"}:
+                        parts.append((action, token if label else keyword))
+                    break
+    return parts if len(parts) > 1 else []
+
+
+def is_compound_action(text: str) -> bool:
+    if is_compound_navigation(text):
         return True
-    if action_count != 1:
-        return False
-    if not has_connector:
-        return False
-    return bool(re.match(r"^(?:输入|填写|选择).+(?:和|并|同时|以及|、).+", compact))
+    return bool(compound_action_parts(text))
+
+
+def explicit_selector_from_text(text: str) -> str:
+    patterns = [
+        r"\[data-testid=(?:\"[^\"]+\"|'[^']+')\]",
+        r"#[A-Za-z][A-Za-z0-9_-]*",
+        r"\.[A-Za-z][A-Za-z0-9_-]*",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(0)
+    return ""
 
 
 def infer_selector(ts_text: str) -> tuple[str, str]:
@@ -341,28 +490,9 @@ def infer_selector(ts_text: str) -> tuple[str, str]:
     Returns:
     (selector, status)
     """
-    if is_captcha(ts_text) or is_compound_action(ts_text):
-        return ("", "todo")
-
-    matched, name = is_text_assertion(ts_text)
-    if matched:
-        return (f"text={name}", "confirmed")
-
-    if is_page_state(ts_text):
-        return ("", "todo")
-
-    matched, name = is_button_action(ts_text)
-    if matched:
-        return (f'role=button[name="{name}"]', "confirmed")
-
-    matched, name = is_input_action(ts_text)
-    if matched:
-        return (f"label={name}", "confirmed")
-
-    matched, name = is_checkbox_action(ts_text)
-    if matched:
-        return (f'role=checkbox[name="{name}"]', "confirmed")
-
+    explicit_selector = explicit_selector_from_text(ts_text)
+    if explicit_selector:
+        return (explicit_selector, "confirmed")
     return ("", "todo")
 
 
@@ -500,29 +630,56 @@ def build_dsl(parsed: dict[str, Any], source: Path, project_root: Path) -> dict[
     def todo_reason_for(source_text: str, reason_kind: str) -> str:
         if is_captcha(source_text):
             return "验证码/图形验证不适合自动化执行，需要人工处理或测试环境绕过"
-        if reason_kind == "expected" or is_page_state(source_text):
-            return "预期结果是页面或业务状态描述，缺少明确 UI 文案，需要人工补充 selector 或断言方式"
-        return "无法从源步骤推断稳定 Playwright locator，需要人工补充"
+        if reason_kind == "operation":
+            return "无法在 DSL 阶段确认 DOM selector，需 enrichment probe 校准"
+        if reason_kind == "page_state":
+            return "expected 为页面/业务状态，不生成 selector"
+        if reason_kind == "prd_unclear":
+            return "PRD 未提供明确 UI 信息"
+        if reason_kind == "compound":
+            return "复合步骤需拆分为原子操作"
+        return "无法在 DSL 阶段确认 DOM selector，需 enrichment probe 校准"
+
+    def add_todo(
+        todo_type: str,
+        key: str,
+        source_case: str,
+        source_step: str,
+        reason_kind: str,
+    ) -> None:
+        todos.append({
+            "type": todo_type,
+            "key": key,
+            "source_case": source_case,
+            "source_step": source_step,
+            "reason": todo_reason_for(source_step, reason_kind),
+        })
 
     def register_selector(
         selector_key: str,
         source_text: str,
         source_case: str,
         source_step: str,
-        reason_kind: str = "selector",
+        reason_kind: str = "operation",
+        action: str = "",
     ) -> None:
         inferred_selector, status = infer_selector(source_text)
         if status == "confirmed":
             selector_value = inferred_selector
+            candidates: list[str] = []
         else:
             selector_value = f'[data-testid="{selector_key}"]'
+            candidates = selector_candidates_for(source_text, action)
 
         existing = selectors.get(selector_key)
         if existing:
             if existing.get("status") == "todo" and status == "confirmed":
                 existing["selector"] = selector_value
                 existing["status"] = "confirmed"
+                existing["candidates"] = []
                 todos[:] = [todo for todo in todos if todo.get("key") != selector_key]
+            elif existing.get("status") == "todo" and candidates:
+                existing["candidates"] = dedupe_keep_order(list(existing.get("candidates", [])) + candidates)
             return
 
         selectors[selector_key] = {
@@ -530,15 +687,10 @@ def build_dsl(parsed: dict[str, Any], source: Path, project_root: Path) -> dict[
             "description": source_text,
             "source": source_text,
             "status": status,
+            "candidates": candidates,
         }
         if status == "todo":
-            todos.append({
-                "type": "selector",
-                "key": selector_key,
-                "source_case": source_case,
-                "source_step": source_step,
-                "reason": todo_reason_for(source_text, reason_kind),
-            })
+            add_todo("selector", selector_key, source_case, source_step, reason_kind)
 
     def add_unsupported(source_case: str, source_step: str, reason: str, suggestion: str) -> None:
         unsupported.append({
@@ -569,26 +721,41 @@ def build_dsl(parsed: dict[str, Any], source: Path, project_root: Path) -> dict[
             "comment": comment,
         })
 
-    def add_todo_expected_step(
+    def add_expected_state_step(
         steps: list[dict[str, Any]],
         source_ts: str,
         expected: str,
         source_case: str,
     ) -> None:
-        selector_key = selector_key_for(expected, "assert_visible", len(steps) + 1)
-        register_selector(selector_key, expected, source_case, source_ts, reason_kind="expected")
+        reason_kind = "prd_unclear" if re.search(r"(?:PRD|规则).*(?:未说明|不明确)", expected) else "page_state"
+        add_todo("expected", "", source_case, expected, reason_kind)
+        add_wait_placeholder(
+            steps,
+            source_ts,
+            "expected is page/business state, selector not generated",
+            source_expected=expected,
+            expected=expected,
+        )
+
+    def add_action_step(
+        steps: list[dict[str, Any]],
+        source_ts: str,
+        action: str,
+        selector_key: str,
+        url: str = "",
+    ) -> None:
         steps.append({
             "id": f"step_{len(steps) + 1:03d}",
             "source_ts": source_ts,
-            "source_expected": expected,
-            "action": "assert_visible",
-            "target": selector_key,
+            "action": action,
+            "target": "" if action == "goto" else selector_key,
             "value": "",
-            "url": "",
-            "expected": expected,
+            "url": url,
+            "expected": "",
+            "source_expected": "",
             "timeout_ms": 5000,
-            "optional": True,
-            "comment": "expected is not confirmed; selector requires review",
+            "optional": False,
+            "comment": "",
         })
 
     for flow_index, case in enumerate(parsed["cases"], start=1):
@@ -598,13 +765,43 @@ def build_dsl(parsed: dict[str, Any], source: Path, project_root: Path) -> dict[
         for step_index, source_step in enumerate(case["steps"], start=1):
             source_ts = source_step["ts"] if isinstance(source_step, dict) else str(source_step)
             if is_compound_action(source_ts):
+                parts = compound_action_parts(source_ts)
+                if parts:
+                    for part_action, part_text in parts:
+                        selector_key = selector_key_for(part_text, part_action, len(steps) + 1)
+                        register_selector(selector_key, part_text, case["tc"], source_ts, action=part_action)
+                        add_action_step(steps, source_ts, part_action, selector_key)
+                    expected_items = source_step.get("expected", []) if isinstance(source_step, dict) else []
+                    for expected in expected_items:
+                        matched, _name = is_text_assertion(expected)
+                        if matched:
+                            action = "assert_text"
+                            selector_key = selector_key_for(expected, action, len(steps) + 1)
+                            register_selector(selector_key, expected, case["tc"], source_ts, action=action)
+                            steps.append({
+                                "id": f"step_{len(steps) + 1:03d}",
+                                "source_ts": source_ts,
+                                "source_expected": expected,
+                                "action": action,
+                                "target": selector_key,
+                                "value": "",
+                                "url": "",
+                                "expected": expected,
+                                "timeout_ms": 5000,
+                                "optional": False,
+                                "comment": "由 ts 子节点预期结果转换",
+                            })
+                        else:
+                            add_expected_state_step(steps, source_ts, expected, case["tc"])
+                    continue
                 add_unsupported(
                     case["tc"],
                     source_ts,
-                    "组合动作需要拆分为多个 UI 步骤",
+                    "复合步骤无法自动拆分",
                     "将该步骤拆分为单一的 click/fill/check 等原子 UI 步骤",
                 )
-                add_wait_placeholder(steps, source_ts, "unsupported manual step, see unsupported_steps")
+                add_todo("unsupported", "", case["tc"], source_ts, "compound")
+                add_wait_placeholder(steps, source_ts, "compound navigation step, requires manual decomposition")
                 continue
 
             if is_captcha(source_ts):
@@ -619,6 +816,16 @@ def build_dsl(parsed: dict[str, Any], source: Path, project_root: Path) -> dict[
 
             action = action_for(source_ts)
             if not action:
+                if re.search(r"^(?:进入|打开|访问|跳转).*(?:页面|表单|流程)$", _compact_text(source_ts)):
+                    add_unsupported(
+                        case["tc"],
+                        source_ts,
+                        "复合步骤无法自动拆分",
+                        "将导航意图拆分为明确 URL goto 或可定位的 click/wait_for 原子步骤",
+                    )
+                    add_todo("unsupported", "", case["tc"], source_ts, "compound")
+                    add_wait_placeholder(steps, source_ts, "compound navigation step, requires manual decomposition")
+                    continue
                 add_unsupported(
                     case["tc"],
                     source_ts,
@@ -640,24 +847,15 @@ def build_dsl(parsed: dict[str, Any], source: Path, project_root: Path) -> dict[
                 continue
 
             if action != "goto":
-                register_selector(selector_key, source_ts, case["tc"], source_ts)
+                register_selector(selector_key, source_ts, case["tc"], source_ts, action=action)
 
-            step: dict[str, Any] = {
-                "id": f"step_{len(steps) + 1:03d}",
-                "source_ts": source_ts,
-                "action": action,
-                "target": "" if action == "goto" else selector_key,
-                "value": "",
-                "url": "",
-                "expected": "",
-                "source_expected": "",
-                "timeout_ms": 5000,
-                "optional": False,
-                "comment": "",
-            }
-            if action == "goto":
-                step["url"] = url_match.group(0) if url_match else ""
-            steps.append(step)
+            add_action_step(
+                steps,
+                source_ts,
+                action,
+                selector_key,
+                url_match.group(0) if action == "goto" and url_match else "",
+            )
 
             expected_items = source_step.get("expected", []) if isinstance(source_step, dict) else []
             for expected in expected_items:
@@ -679,12 +877,12 @@ def build_dsl(parsed: dict[str, Any], source: Path, project_root: Path) -> dict[
 
                 matched, _name = is_text_assertion(expected)
                 if not matched:
-                    add_todo_expected_step(steps, source_ts, expected, case["tc"])
+                    add_expected_state_step(steps, source_ts, expected, case["tc"])
                     continue
 
                 action = "assert_text"
                 selector_key = selector_key_for(expected, action, len(steps) + 1)
-                register_selector(selector_key, expected, case["tc"], source_ts, reason_kind="expected")
+                register_selector(selector_key, expected, case["tc"], source_ts, action=action)
                 steps.append({
                     "id": f"step_{len(steps) + 1:03d}",
                     "source_ts": source_ts,
@@ -718,12 +916,12 @@ def build_dsl(parsed: dict[str, Any], source: Path, project_root: Path) -> dict[
 
             matched, _name = is_text_assertion(expected)
             if not matched:
-                add_todo_expected_step(steps, expected, expected, case["tc"])
+                add_expected_state_step(steps, expected, expected, case["tc"])
                 continue
 
             action = "assert_text"
             selector_key = selector_key_for(expected, action, len(steps) + 1)
-            register_selector(selector_key, expected, case["tc"], expected, reason_kind="expected")
+            register_selector(selector_key, expected, case["tc"], expected, action=action)
             steps.append({
                 "id": f"step_{len(steps) + 1:03d}",
                 "source_ts": expected,
@@ -817,11 +1015,23 @@ def validate_dsl(dsl: dict[str, Any]) -> list[str]:
             if not isinstance(value, dict):
                 errors.append(f"selector {key} 必须是对象")
                 continue
-            for selector_field in ["selector", "description", "source", "status"]:
+            for selector_field in ["selector", "description", "source", "status", "candidates"]:
                 if selector_field not in value:
                     errors.append(f"selector {key} 缺少字段: {selector_field}")
             if value.get("status") not in {"todo", "confirmed"}:
                 errors.append(f"selector {key} status 只能是 todo 或 confirmed")
+            if value.get("status") == "confirmed" and not explicit_selector_from_text(str(value.get("selector", ""))):
+                errors.append(f"selector {key} confirmed 必须来自显式 selector")
+            candidates = value.get("candidates")
+            if not isinstance(candidates, list):
+                errors.append(f"selector {key} candidates 必须是数组")
+            else:
+                for candidate in candidates:
+                    if not isinstance(candidate, str):
+                        errors.append(f"selector {key} candidates 只能包含字符串")
+                        continue
+                    if not candidate.startswith(("role=", "label=", "placeholder=", "text=", "[data-testid=", "#", ".")):
+                        errors.append(f"selector {key} candidate 前缀不合法: {candidate}")
 
     if not isinstance(dsl.get("test_data"), dict):
         errors.append("test_data 必须是对象")

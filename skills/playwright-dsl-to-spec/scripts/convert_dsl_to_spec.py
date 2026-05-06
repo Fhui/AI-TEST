@@ -21,7 +21,7 @@ from typing import Any
 
 ALLOWED_TOP = {"schema_version", "meta", "selectors", "test_data", "flows", "todos", "unsupported_steps"}
 ALLOWED_META = {"system", "version", "module", "source", "generated_at", "description"}
-ALLOWED_SELECTOR = {"selector", "description", "source", "status"}
+ALLOWED_SELECTOR = {"selector", "description", "source", "status", "candidates"}
 ALLOWED_TEST_DATA = {"value", "description"}
 ALLOWED_FLOW = {"id", "name", "module", "priority", "source_case", "tags", "preconditions", "steps"}
 ALLOWED_SOURCE_CASE = {"tc", "tp"}
@@ -131,6 +131,8 @@ def parse_yaml_subset(text: str) -> Any:
             die(f"Unexpected indentation at line: {current_text}")
         if current_text.startswith("- "):
             return parse_list(index, indent)
+        if current_text in {"[]", "{}"}:
+            return parse_scalar(current_text), index + 1
         return parse_map(index, indent)
 
     def parse_map(index: int, indent: int) -> tuple[dict[str, Any], int]:
@@ -300,8 +302,9 @@ def find_project_root(start: Path) -> Path:
 
 def find_single_input(project_root: Path) -> Path:
     matches = sorted(project_root.glob("*/ui-dsl/ui-test.dsl.yaml"))
+    matches.extend(sorted(project_root.glob("*/ui-dsl/ui-test.enriched.dsl.yaml")))
     if not matches:
-        die(f"No */ui-dsl/ui-test.dsl.yaml found under {project_root}")
+        die(f"No */ui-dsl/ui-test.dsl.yaml or */ui-dsl/ui-test.enriched.dsl.yaml found under {project_root}")
     if len(matches) > 1:
         rels = "\n".join(f"- ./{path.relative_to(project_root)}" for path in matches)
         die(f"Multiple DSL files found; pass --input explicitly:\n{rels}")
@@ -310,6 +313,13 @@ def find_single_input(project_root: Path) -> Path:
 
 def js_string(value: Any) -> str:
     return json.dumps("" if value is None else str(value), ensure_ascii=False)
+
+
+def js_single_string(value: Any) -> str:
+    text = "" if value is None else str(value)
+    text = text.replace("\\", "\\\\").replace("'", "\\'")
+    text = text.replace("\n", "\\n").replace("\r", "\\r")
+    return f"'{text}'"
 
 
 def ts_comment(text: str) -> str:
@@ -339,7 +349,7 @@ def step_label(step: dict[str, Any]) -> str:
 
 
 def todo_line(step: dict[str, Any], message: str) -> str:
-    return f"  {ts_comment(f'TODO {step_label(step)}: {message}')}"
+    return f"  throw new Error({js_string(f'TODO {step_label(step)}: {message}')});"
 
 
 def test_data_expression(value: Any, test_data: dict[str, Any]) -> str:
@@ -351,6 +361,24 @@ def test_data_expression(value: Any, test_data: dict[str, Any]) -> str:
     if key not in test_data:
         die(f"value references unknown test_data key: {key}")
     return f"testData[{js_string(key)}]"
+
+
+def build_locator(selector: str) -> str:
+    role_match = re.fullmatch(r"""role=(button|checkbox|textbox|link)\[name=(["'])(.*)\2\]""", selector)
+    if role_match:
+        role, _quote, name = role_match.groups()
+        return f"page.getByRole({js_single_string(role)}, {{ name: {js_single_string(name)} }})"
+    test_id_match = re.fullmatch(r"""\[data-testid=(["'])(.*)\1\]""", selector)
+    if test_id_match:
+        _quote, test_id = test_id_match.groups()
+        return f"page.getByTestId({js_single_string(test_id)})"
+    if selector.startswith("label="):
+        return f"page.getByLabel({js_single_string(selector[len('label=') :])})"
+    if selector.startswith("placeholder="):
+        return f"page.getByPlaceholder({js_single_string(selector[len('placeholder=') :])})"
+    if selector.startswith("text="):
+        return f"page.getByText({js_single_string(selector[len('text=') :])}, {{ exact: true }})"
+    return f"page.locator({js_single_string(selector)})"
 
 
 def operation_lines(step: dict[str, Any], selectors: dict[str, Any], test_data: dict[str, Any]) -> list[str]:
@@ -375,7 +403,7 @@ def operation_lines(step: dict[str, Any], selectors: dict[str, Any], test_data: 
     if selector.get("status") == "todo":
         return [todo_line(step, f"selector {target!r} 仍为 todo，确认真实 selector 后再执行")]
 
-    locator = f"page.locator({js_string(selector.get('selector', ''))})"
+    locator = build_locator(str(selector.get("selector", "") or ""))
     if action == "click":
         return [f"  await {locator}.click({{ timeout: {timeout} }});"]
     if action == "fill":
@@ -404,6 +432,15 @@ def operation_lines(step: dict[str, Any], selectors: dict[str, Any], test_data: 
             lines.append(f"  {ts_comment(f'TODO {step_label(step)}: 根据 expected 补充具体状态断言：{expected}')}")
         return lines
     die(f"Unsupported action after validation: {action}")
+
+
+def step_mapping_comments(flow: dict[str, Any], step: dict[str, Any]) -> list[str]:
+    return [
+        f"  // flow_id: {flow.get('id', '')}",
+        f"  // step_id: {step.get('id', '')}",
+        f"  // source_ts: {step.get('source_ts', '')}",
+        f"  // selector_key: {step.get('target', '')}",
+    ]
 
 
 def wrap_optional(lines: list[str], step: dict[str, Any]) -> list[str]:
@@ -436,6 +473,8 @@ def render_spec(flow: dict[str, Any], selectors: dict[str, Any], test_data: dict
     lines.append("")
 
     for step in flow.get("steps", []):
+        for line in step_mapping_comments(flow, step):
+            lines.append(f"  {line}")
         for line in wrap_optional(operation_lines(step, selectors, test_data), step):
             lines.append(f"  {line}")
         lines.append("")
@@ -446,7 +485,11 @@ def render_spec(flow: dict[str, Any], selectors: dict[str, Any], test_data: dict
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", type=Path, help="Path to ./<delivery-name>/ui-dsl/ui-test.dsl.yaml")
+    parser.add_argument(
+        "--input",
+        type=Path,
+        help="Path to ./<delivery-name>/ui-dsl/ui-test.dsl.yaml or ui-test.enriched.dsl.yaml",
+    )
     parser.add_argument("--output-dir", type=Path, help="Path to ./<delivery-name>/playwright/tests")
     args = parser.parse_args()
 
@@ -460,9 +503,12 @@ def main() -> int:
     delivery_root = input_path.parent.parent
     if delivery_root.parent != project_root:
         die("Input delivery directory must be a direct child of the project root")
-    expected_input = delivery_root / "ui-dsl" / "ui-test.dsl.yaml"
-    if input_path != expected_input:
-        die("Input must match ./<delivery-name>/ui-dsl/ui-test.dsl.yaml")
+    allowed_inputs = {
+        delivery_root / "ui-dsl" / "ui-test.dsl.yaml",
+        delivery_root / "ui-dsl" / "ui-test.enriched.dsl.yaml",
+    }
+    if input_path not in allowed_inputs:
+        die("Input must match ./<delivery-name>/ui-dsl/ui-test.dsl.yaml or ui-test.enriched.dsl.yaml")
 
     output_dir = (args.output_dir.resolve() if args.output_dir else delivery_root / "playwright" / "tests")
     if output_dir != delivery_root / "playwright" / "tests":

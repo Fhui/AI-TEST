@@ -1,13 +1,19 @@
 # Running Playwright Tests
 
-To run Playwright tests, use the `npx playwright test` command, or a package manager script. To avoid opening the interactive html report, use `PLAYWRIGHT_HTML_OPEN=never` environment variable.
+To run Playwright tests for the AI test pipeline, always enable the JSON reporter and write the fixed result file used by `playwright-result-report`: `./<delivery-name>/playwright/results.json`. To avoid opening the interactive html report, use `PLAYWRIGHT_HTML_OPEN=never`.
 
 ```bash
 # Run all tests
-PLAYWRIGHT_HTML_OPEN=never npx playwright test
+PLAYWRIGHT_HTML_OPEN=never PLAYWRIGHT_JSON_OUTPUT_NAME=./<delivery-name>/playwright/results.json npx playwright test ./<delivery-name>/playwright/tests --reporter=json
 
 # Run all tests through a custom npm script
-PLAYWRIGHT_HTML_OPEN=never npm run special-test-command
+PLAYWRIGHT_HTML_OPEN=never PLAYWRIGHT_JSON_OUTPUT_NAME=./<delivery-name>/playwright/results.json npm run special-test-command -- --reporter=json
+```
+
+When a base URL is required, keep the same fixed JSON reporter contract:
+
+```bash
+BASE_URL=<baseURL> PLAYWRIGHT_HTML_OPEN=never PLAYWRIGHT_JSON_OUTPUT_NAME=./<delivery-name>/playwright/results.json npx playwright test ./<delivery-name>/playwright/tests --reporter=json
 ```
 
 # Debugging Playwright Tests
