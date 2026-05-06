@@ -1,5 +1,6 @@
 # Generated delivery artifacts
 /password-login-flow/
+/scripts/
 
 # Local agent state
 /.claude/
