@@ -1,0 +1,29 @@
+{
+  "system": "sample-system",
+  "module": "sample-module",
+  "retrieval_summary": {
+    "query": {
+      "business_objects": ["object-a"],
+      "workflow": ["create -> process -> result"]
+    },
+    "hit_count": 3
+  },
+  "workflow_hits": [
+    {
+      "id": "WF-001",
+      "name": "create -> process -> result",
+      "source": "historical_prd"
+    }
+  ],
+  "strong_related": [],
+  "medium_related": [],
+  "weak_related": [],
+  "reused_testcases": [],
+  "regression_candidates": [],
+  "risk_candidates": [],
+  "upstream_dependencies": [],
+  "downstream_dependencies": [],
+  "shared_rules": [],
+  "conflicts": [],
+  "open_questions": []
+}

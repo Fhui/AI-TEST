@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """对 UI DSL 做 dry/probe 两种模式的 selector 补全。"""
 
 from __future__ import annotations
@@ -8,6 +9,7 @@ import asyncio
 import copy
 import os
 import re
+from difflib import SequenceMatcher
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -23,7 +25,7 @@ BUTTON_HINTS = ("button", "按钮", "点击", "提交", "确认")
 INPUT_HINTS = ("input", "输入", "填写", "手机号", "密码", "名称")
 CHECKBOX_HINTS = ("checkbox", "勾选", "选中", "协议", "同意")
 TEXT_HINTS = ("显示", "提示", "看到", "校验文案")
-UNSAFE_SELECTOR_HINTS = ("captcha", "图形验证码", "验证码", "滑块", "极验", "手动验证", "手动完成验证")
+UNSAFE_SELECTOR_HINTS = ("captcha", "图形验证码", "图形验证", "验证码", "滑块", "极验", "手动验证", "手动完成验证")
 UNSAFE_STEP_HINTS = (
     "delete",
     "remove",
@@ -37,6 +39,7 @@ UNSAFE_STEP_HINTS = (
     "提交",
     "保存",
     "支付",
+    "下单",
     "确认订单",
     "发布",
     "审批",
@@ -55,6 +58,9 @@ class Candidate:
     count: int | None = None
     visible_count: int | None = None
     visible_index: int | None = None
+    score: float | None = None
+    threshold: float | None = None
+    fuzzy_allowed: bool | None = None
     note: str = ""
 
 
@@ -100,6 +106,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed-selectors", help="seed selector YAML 文件路径，用于人工锚点覆盖")
     parser.add_argument("--reuse-session", action="store_true", help="probe 模式复用同一个浏览器页面状态执行多个 flow")
     parser.add_argument("--persist-runtime", action="store_true", help="将 runtime-confirmed selector 写回 enriched DSL")
+    parser.add_argument("--allow-fuzzy-click", action="store_true", help="允许 runtime click 使用 fuzzy score 门控做探索式安全点击")
+    parser.add_argument(
+        "--fuzzy-click-threshold",
+        type=float,
+        default=0.90,
+        help="Minimum score required for fuzzy runtime click (default: 0.90)",
+    )
     parser.add_argument("--screenshot", action="store_true", help="是否在 probe 模式记录每个 step 执行后的页面截图")
     parser.add_argument("--screenshot-dir", help="截图输出目录（默认：<delivery>/playwright/probe-screenshots）")
     parser.add_argument(
@@ -113,13 +126,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--viewport", help="覆盖浏览器 viewport，格式：390x844")
     parser.add_argument("--geolocation", help="设置地理位置，格式：30.2741,120.1551")
     parser.add_argument("--permissions", help="授权权限列表，格式：geolocation,camera")
+    parser.add_argument("--debug", action="store_true", help="输出候选生成和 locator 探测调试日志")
     parser.add_argument(
         "--mode",
         choices=("dry", "probe"),
         default="dry",
         help="dry：只生成候选；probe：受控执行 flow 前置步骤后做 locator count 探测",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not 0.0 <= args.fuzzy_click_threshold <= 1.0:
+        parser.error("--fuzzy-click-threshold 必须在 0.0 到 1.0 之间。")
+    return args
 
 
 def resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
@@ -210,6 +227,8 @@ def probe_environment_lines(args: argparse.Namespace) -> list[str]:
         f"- geolocation: {as_text(getattr(args, 'geolocation', ''))}",
         f"- permissions: {as_text(getattr(args, 'permissions', ''))}",
         f"- screenshot-mode: {as_text(getattr(args, 'screenshot_mode', 'viewport'))}",
+        f"- allow-fuzzy-click: {str(bool(getattr(args, 'allow_fuzzy_click', False))).lower()}",
+        f"- fuzzy-click-threshold: {getattr(args, 'fuzzy_click_threshold', 0.90):.2f}",
     ]
 
 
@@ -300,6 +319,8 @@ def contains_any(text: str, hints: tuple[str, ...]) -> bool:
 def clean_label(text: str) -> str:
     cleaned = re.sub(r"\s+", " ", text.strip())
     cleaned = re.sub(r"^[：:，,。.\s]+|[：:，,。.\s]+$", "", cleaned)
+    for phrase in ("以已登录状态", "以未登录状态", "连续多次", "清空或不", "不输入", "保持", "直接", "再次", "重新"):
+        cleaned = cleaned.replace(phrase, "")
     for word in ACTION_WORDS:
         cleaned = cleaned.replace(word, "")
     cleaned = cleaned.replace("button", "").replace("input", "")
@@ -313,7 +334,7 @@ def is_noisy_label(label: str) -> bool:
     lowered = normalized.lower()
     if re.match(r"^cn[_ ]", lowered):
         return True
-    if "并" in normalized or len(normalized) > 12:
+    if "并" in normalized or len(normalized) > 24:
         return True
     if lowered in NOISE_LABELS:
         return True
@@ -380,10 +401,6 @@ def generate_candidates(key: str, entry: dict[str, Any], data: dict[str, Any]) -
     for selector in dsl_candidate_values(entry):
         add(selector, "dsl candidate")
 
-    if candidates:
-        is_unsafe = contains_any(combined, UNSAFE_SELECTOR_HINTS)
-        return description, source, candidates, is_unsafe
-
     if current_selector and not is_placeholder_selector(current_selector, key):
         add(current_selector, "原始 selector")
 
@@ -406,12 +423,8 @@ def generate_candidates(key: str, entry: dict[str, Any], data: dict[str, Any]) -
         for label in labels:
             add(f"text={label}", "text locator", label)
 
-    if not any(candidate.selector.startswith("text=") for candidate in candidates):
-        if labels:
-            add(f"text={labels[0]}", "text locator (fallback)", labels[0])
-
-    print(f"[DEBUG] key={key} labels={labels}")
-    print(f"[DEBUG] candidates={[candidate.selector for candidate in candidates]}")
+    if not candidates and labels:
+        add(f"text={labels[0]}", "text locator (fallback)", labels[0])
 
     is_unsafe = contains_any(combined, UNSAFE_SELECTOR_HINTS)
     return description, source, candidates, is_unsafe
@@ -443,6 +456,60 @@ def locator_for_action(page: Any, selector: str) -> Any:
     if selector.startswith("text="):
         return page.get_by_text(selector[len("text=") :], exact=True)
     return page.locator(selector)
+
+
+def selector_label(selector: str) -> str:
+    role_match = re.fullmatch(r'role=([A-Za-z0-9_-]+)\[name="(.*)"\]', selector)
+    if role_match:
+        return role_match.group(2)
+    for prefix in ("label=", "placeholder=", "text="):
+        if selector.startswith(prefix):
+            return selector[len(prefix) :]
+    return ""
+
+
+async def visible_locator_text(locator: Any) -> str:
+    text_parts: list[str] = []
+    for getter in (
+        lambda: locator.inner_text(timeout=1000),
+        lambda: locator.text_content(timeout=1000),
+        lambda: locator.get_attribute("aria-label", timeout=1000),
+        lambda: locator.get_attribute("placeholder", timeout=1000),
+        lambda: locator.input_value(timeout=1000),
+    ):
+        try:
+            value = await getter()
+        except Exception:
+            continue
+        value_text = as_text(value).strip()
+        if value_text:
+            text_parts.append(value_text)
+    return " ".join(dict.fromkeys(text_parts))
+
+
+def text_similarity(expected: str, actual: str) -> float | None:
+    expected = re.sub(r"\s+", "", expected.strip())
+    actual = re.sub(r"\s+", "", actual.strip())
+    if not expected or not actual:
+        return None
+    if expected == actual:
+        return 1.0
+    if expected in actual or actual in expected:
+        shorter = min(len(expected), len(actual))
+        longer = max(len(expected), len(actual))
+        return shorter / longer if longer else 0.0
+    return SequenceMatcher(None, expected, actual).ratio()
+
+
+async def update_fuzzy_score(candidate: Candidate, locator: Any, threshold: float, allow_fuzzy_click: bool) -> None:
+    candidate.threshold = threshold
+    candidate.fuzzy_allowed = False
+    if candidate.visible_count != 1 or candidate.visible_index is None or not is_runtime_click_candidate(candidate):
+        return
+    expected = selector_label(candidate.selector)
+    actual = await visible_locator_text(locator.nth(candidate.visible_index))
+    candidate.score = text_similarity(expected, actual)
+    candidate.fuzzy_allowed = bool(allow_fuzzy_click and candidate.score is not None and candidate.score >= threshold)
 
 
 def resolve_url(base_url: str, step_url: str) -> str:
@@ -539,6 +606,42 @@ def is_runtime_click_candidate(candidate: Candidate) -> bool:
     )
 
 
+def is_role_selector(selector: str, role: str | None = None) -> bool:
+    match = re.fullmatch(r'role=([A-Za-z0-9_-]+)\[name=".*"\]', selector)
+    if not match:
+        return False
+    return role is None or match.group(1) == role
+
+
+def candidate_locator_rank(candidate: Candidate) -> int:
+    selector = candidate.selector
+    strategy = candidate.strategy
+    if strategy == "dsl candidate" and any(is_role_selector(selector, role) for role in ("button", "link", "checkbox", "textbox")):
+        return 1
+    if strategy == "role locator":
+        return 2
+    if strategy == "label locator":
+        return 3
+    if strategy == "placeholder locator":
+        return 4
+    if strategy == "dsl candidate" and selector.startswith("text="):
+        return 5
+    if strategy == "text locator":
+        return 6
+    if strategy == "text locator (fallback)":
+        return 7
+    if strategy == "dsl candidate":
+        return 8
+    if strategy == "原始 selector":
+        return 9
+    return 10
+
+
+def candidate_priority(candidate: Candidate) -> tuple[float, int, str]:
+    score = candidate.score if candidate.score is not None else 0.0
+    return (candidate_locator_rank(candidate), -score, candidate.selector)
+
+
 async def wait_after_click(page: Any) -> str:
     try:
         await page.wait_for_load_state("networkidle", timeout=3000)
@@ -618,6 +721,9 @@ async def probe_result_on_page(
     *,
     write_back: bool,
     runtime_only: bool = False,
+    allow_fuzzy_click: bool = False,
+    fuzzy_click_threshold: float = 0.90,
+    debug: bool = False,
 ) -> Candidate | None:
     if result.reason.startswith("安全策略"):
         return None
@@ -629,31 +735,49 @@ async def probe_result_on_page(
             locator = locator_for_action(page, candidate.selector)
             candidate.count = await locator.count()
             candidate.visible_count, candidate.visible_index = await visible_locator_info(locator)
-            print(
-                f"[VISIBLE] selector={candidate.selector} "
-                f"count={candidate.count} "
-                f"visible={candidate.visible_count}"
-            )
+            await update_fuzzy_score(candidate, locator, fuzzy_click_threshold, allow_fuzzy_click)
+            if debug:
+                print(
+                    f"[VISIBLE] selector={candidate.selector} "
+                    f"count={candidate.count} "
+                    f"visible={candidate.visible_count} "
+                    f"score={candidate.score} "
+                    f"threshold={candidate.threshold} "
+                    f"fuzzy_allowed={candidate.fuzzy_allowed}"
+                )
             visibility_note = (
                 f"flow={flow_id} count={candidate.count} "
                 f"visible_count={candidate.visible_count} "
-                f"visible_index={candidate.visible_index}"
+                f"visible_index={candidate.visible_index} "
+                f"score={candidate.score} "
+                f"threshold={candidate.threshold} "
+                f"fuzzy_allowed={candidate.fuzzy_allowed}"
             )
             candidate.note = f"{candidate.note}; {visibility_note}".strip("; ")
         except Exception as exc:  # noqa: BLE001 - 单个 locator 失败不影响其他候选
             candidate.count = -1
             candidate.visible_count = None
             candidate.visible_index = None
+            candidate.score = None
+            candidate.fuzzy_allowed = False
             candidate.note = f"locator 探测失败：{exc}"
 
     unique = [
         candidate
         for candidate in result.candidates
-        if candidate.visible_count == 1 and (not runtime_only or is_runtime_click_candidate(candidate))
+        if candidate.visible_count == 1
+        and (
+            not runtime_only
+            or (
+                is_runtime_click_candidate(candidate)
+                and (not allow_fuzzy_click or candidate.fuzzy_allowed is True)
+            )
+        )
     ]
     if not unique:
         return None
 
+    unique = sorted(unique, key=candidate_priority)
     selected = unique[0]
     if write_back:
         update_enriched_selector(enriched, result, selected.selector)
@@ -728,6 +852,9 @@ async def execute_probe_step(
                 flow_id,
                 write_back=False,
                 runtime_only=True,
+                allow_fuzzy_click=bool(getattr(args, "allow_fuzzy_click", False)),
+                fuzzy_click_threshold=float(getattr(args, "fuzzy_click_threshold", 0.90)),
+                debug=bool(getattr(args, "debug", False)),
             )
             if runtime_candidate:
                 if persist_runtime:
@@ -749,12 +876,21 @@ async def execute_probe_step(
                     step_id,
                     action,
                     "runtime-confirmed",
-                    f"runtime-confirmed{persist_note} click using {runtime_candidate.selector}; count={runtime_candidate.count}; visible_count={runtime_candidate.visible_count}; visible_index={runtime_candidate.visible_index}; before_url={before_url}; after_url={after_url}; stable={stable_state}",
+                    f"runtime-confirmed{persist_note} click using {runtime_candidate.selector}; count={runtime_candidate.count}; visible_count={runtime_candidate.visible_count}; visible_index={runtime_candidate.visible_index}; score={runtime_candidate.score}; threshold={runtime_candidate.threshold}; fuzzy_allowed={runtime_candidate.fuzzy_allowed}; before_url={before_url}; after_url={after_url}; stable={stable_state}",
                     args,
                 )
 
         if result:
-            selected = await probe_result_on_page(page, result, enriched, flow_id, write_back=True)
+            selected = await probe_result_on_page(
+                page,
+                result,
+                enriched,
+                flow_id,
+                write_back=False,
+                allow_fuzzy_click=bool(getattr(args, "allow_fuzzy_click", False)),
+                fuzzy_click_threshold=float(getattr(args, "fuzzy_click_threshold", 0.90)),
+                debug=bool(getattr(args, "debug", False)),
+            )
             if selected:
                 locator = locator_for_action(page, selected.selector)
                 ok, visible_locator, visibility_reason = await unique_visible_locator(locator)
@@ -769,6 +905,11 @@ async def execute_probe_step(
                         args,
                     )
                 before_url, after_url, stable_state = await perform_stable_click(page, visible_locator, timeout_ms)
+                update_enriched_selector(enriched, result, selected.selector)
+                result.result = "confirmed"
+                result.reason = f"click 成功后确认候选：{selected.selector}"
+                result.strategy = selected.strategy
+                result.flow_id = flow_id
                 state.first_click_seen = True
                 return await make_probe_event(
                     page,
@@ -837,8 +978,9 @@ async def probe_selector_results(
                 try:
                     flow_steps = [step for step in flow.get("steps", []) if isinstance(step, dict)]
                     first_action = as_text(flow_steps[0].get("action")).lower() if flow_steps else ""
-                    if (not reuse_session and not flow_steps) or first_action != "goto":
-                        await page.goto(base_url, wait_until="domcontentloaded", timeout=30000)
+                    if first_action != "goto":
+                        if not reuse_session or page.url == "about:blank":
+                            await page.goto(base_url, wait_until="domcontentloaded", timeout=30000)
                     target_keys = flow_target_selector_keys(flow_steps, results)
                     if not target_keys:
                         events.append(ProbeEvent(flow_id, "_flow_", "probe", "skipped", "本 flow steps 未使用 todo target selector，跳过 selector 探测。"))
@@ -863,7 +1005,7 @@ async def probe_selector_results(
                             break
                     if aborted:
                         continue
-                    await probe_counts_on_page(page, results, enriched, flow_id, target_keys)
+                    await probe_counts_on_page(page, results, enriched, flow_id, target_keys, args)
                 finally:
                     if not reuse_session:
                         await page.close()
@@ -876,7 +1018,14 @@ async def probe_selector_results(
     return "", events
 
 
-async def probe_counts_on_page(page: Any, results: dict[str, SelectorResult], enriched: dict[str, Any], flow_id: str, target_keys: set[str]) -> None:
+async def probe_counts_on_page(
+    page: Any,
+    results: dict[str, SelectorResult],
+    enriched: dict[str, Any],
+    flow_id: str,
+    target_keys: set[str],
+    args: argparse.Namespace,
+) -> None:
     try:
         await page.wait_for_load_state("networkidle", timeout=5000)
     except Exception:
@@ -886,7 +1035,15 @@ async def probe_counts_on_page(page: Any, results: dict[str, SelectorResult], en
             continue
         if result.final_status.lower() == "confirmed" or result.reason.startswith("安全策略"):
             continue
-        await probe_result_on_page(page, result, enriched, flow_id, write_back=True)
+        await probe_result_on_page(
+            page,
+            result,
+            enriched,
+            flow_id,
+            write_back=True,
+            fuzzy_click_threshold=float(getattr(args, "fuzzy_click_threshold", 0.90)),
+            debug=bool(getattr(args, "debug", False)),
+        )
 
 
 def apply_results(enriched: dict[str, Any], results: dict[str, SelectorResult], mode: str, probe_error: str) -> None:
@@ -1027,19 +1184,22 @@ def write_report(
                 f"- 使用策略：{result.strategy or '_未确认_'}",
                 f"- 命中 flow：{result.flow_id or '_无_'}",
                 "",
-                "| 候选 locator | 策略 | count | visible_count | visible_index | 备注 |",
-                "| --- | --- | ---: | ---: | ---: | --- |",
+                "| 候选 locator | 策略 | count | visible_count | visible_index | score | threshold | fuzzy_allowed | 备注 |",
+                "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |",
             ]
         )
         for candidate in result.candidates:
             count = "" if candidate.count is None else str(candidate.count)
             visible_count = "" if candidate.visible_count is None else str(candidate.visible_count)
             visible_index = "" if candidate.visible_index is None else str(candidate.visible_index)
+            score = "" if candidate.score is None else f"{candidate.score:.2f}"
+            threshold = "" if candidate.threshold is None else f"{candidate.threshold:.2f}"
+            fuzzy_allowed = "" if candidate.fuzzy_allowed is None else str(candidate.fuzzy_allowed).lower()
             lines.append(
-                f"| `{markdown_escape(candidate.selector)}` | {markdown_escape(candidate.strategy)} | {count} | {visible_count} | {visible_index} | {markdown_escape(candidate.note)} |"
+                f"| `{markdown_escape(candidate.selector)}` | {markdown_escape(candidate.strategy)} | {count} | {visible_count} | {visible_index} | {score} | {threshold} | {fuzzy_allowed} | {markdown_escape(candidate.note)} |"
             )
         if not result.candidates:
-            lines.append("| _无_ |  |  |  |  |  |")
+            lines.append("| _无_ |  |  |  |  |  |  |  |  |")
         lines.append("")
 
     path.parent.mkdir(parents=True, exist_ok=True)

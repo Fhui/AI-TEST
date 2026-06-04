@@ -1,12 +1,15 @@
 # AI Test Skills
 
-这个仓库用于沉淀测试工程相关的 Codex skills，覆盖从 PRD 分析、测试用例建模、UI DSL 生成、Playwright spec 转换，到 selector 补全校准的端到端测试资产生产流程。
+这个仓库用于沉淀测试工程相关的 Codex skills 与 MCP 服务，覆盖测试知识检索、PRD 分析、测试用例建模、UI DSL 生成、selector 补全校准、Playwright spec 转换、执行与报告的端到端测试资产生产流程。
 
 ## What Is In This Repo
 
 ```text
 .
 ├── skills/                  # 可提交、可复用的 skill 源文件
+├── mcp/                     # 测试工程 MCP 服务
+│   └── test-knowledge-mcp/  # 测试知识库扫描、索引、校验与召回
+├── tests/                   # 自动化测试
 ├── AGENTS.md                # Codex 项目约束
 └── .gitignore               # 忽略本地工具状态与生成产物
 ```
@@ -18,7 +21,8 @@
 | Skill | Purpose |
 | --- | --- |
 | `ai-test-runner` | 调度完整 AI 测试流水线，按需串联 PRD、DSL、selector、spec、执行与报告阶段。 |
-| `prd-to-xmind-testcases` | 将 Markdown PRD 解析为 XMind 风格测试用例树。 |
+| `test-knowledge-retrieval` | 通过 `test-knowledge-mcp` 检索历史 PRD、测试用例、缺陷、接口和依赖资料，生成结构化上下文包。 |
+| `prd-to-xmind-testcases` | 基于 PRD 和可选知识上下文，按复杂度选择分析深度并生成 XMind 风格测试用例树。 |
 | `testcase-to-playwright-dsl` | 将 XMind 风格 Markdown 测试用例转换为 UI DSL YAML。 |
 | `dsl-selector-enrichment` | 对 UI DSL 中的 todo selector 做候选生成与受控 probe 校准。 |
 | `playwright-dsl-to-spec` | 将 UI DSL 转换为 Playwright spec。 |
@@ -29,6 +33,8 @@
 
 ```text
 PRD Markdown
+  -> test-knowledge-retrieval (optional)
+  -> analysis/context-package.json
   -> prd-to-xmind-testcases
   -> testcase/xmind-testcases.md
   -> testcase-to-playwright-dsl
@@ -42,6 +48,8 @@ PRD Markdown
   -> playwright-result-report
   -> reports/ui-test-report.md
 ```
+
+`test-knowledge-mcp` 为知识检索阶段提供测试知识库扫描、分片索引、metadata 提取、规则召回、资产枚举和知识库校验能力。它只读取 Markdown 等 AI source；配套 `.xmind` 仅作为预览资产和配对信息，不读取、不解析、不修改。
 
 `ai-test-runner` 作为流水线调度器使用，统一阶段定义如下：
 
@@ -103,6 +111,8 @@ scripts/sync-skills.sh
 可提交内容主要包括：
 
 - `skills/`
+- `mcp/`
+- `tests/`
 - `README.md`
 - `AGENTS.md`
 

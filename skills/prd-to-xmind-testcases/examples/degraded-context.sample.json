@@ -1,0 +1,9 @@
+{
+  "historical_context_missing": true,
+  "degraded_mode": true,
+  "context_validation": {
+    "valid": false,
+    "missing_fields": ["context-package.json"],
+    "warnings": ["test-knowledge-retrieval unavailable"]
+  }
+}

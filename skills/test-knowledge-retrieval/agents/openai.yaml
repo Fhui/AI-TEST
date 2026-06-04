@@ -1,0 +1,4 @@
+interface:
+  display_name: "测试知识检索"
+  short_description: "检索并组织测试知识库上下文"
+  default_prompt: "使用 $test-knowledge-retrieval 基于当前 PRD 检索历史 PRD、测试用例、缺陷、接口、上下游、发布说明和 shared 规则上下文。"

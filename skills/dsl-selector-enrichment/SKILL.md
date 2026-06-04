@@ -49,7 +49,8 @@ probe 模式：
 - fill 缺失 `${test_data_key}` 或对应值为空时直接跳过并记录
 - 每个 flow 只对本 flow steps 中用到的 todo target selector 候选做 Playwright locator `count()` 探测
 - `点击 XXX` 不硬判为 button；候选集至少包含 `role=button[name="XXX"]`、`role=link[name="XXX"]`、`text=XXX`
-- 只有 `count == 1` 时才写入 enriched DSL 并标记 `confirmed`
+- 只有 `visible_count == 1` 时才允许 runtime click 或写入 enriched DSL 并标记 `confirmed`
+- 可选 `--allow-fuzzy-click` 对第一个 runtime click 增加文本相似度阈值门控，默认阈值为 `0.90`
 
 ## 使用方式
 
@@ -116,6 +117,39 @@ python .codex/skills/dsl-selector-enrichment/scripts/enrich_selectors.py \
 
 `--seed-selectors` 用于人工锚点，优先级最高。`--reuse-session` 复用同一页面状态执行多个 flow。`--persist-runtime` 会把 runtime-confirmed selector 写回 enriched DSL；默认不写回。第一轮 probe 不建议同时使用 `--persist-runtime`，应在 selector 稳定后再开启。
 
+fuzzy runtime click 推荐参数（安全）：
+
+```bash
+python .codex/skills/dsl-selector-enrichment/scripts/enrich_selectors.py \
+  --mode probe \
+  --base-url <page-url> \
+  --reuse-session \
+  --allow-fuzzy-click \
+  --input ./<delivery-name>/ui-dsl/ui-test.dsl.yaml \
+  --output ./<delivery-name>/ui-dsl/ui-test.enriched.dsl.yaml \
+  --report ./<delivery-name>/ui-dsl/selector-enrichment-report.md \
+  --unresolved ./<delivery-name>/ui-dsl/unresolved-selectors.md
+```
+
+`--allow-fuzzy-click` 默认使用 `--fuzzy-click-threshold 0.90`，适合稳定自动化前的保守探测。
+
+fuzzy runtime click 调试参数（探索模式）：
+
+```bash
+python .codex/skills/dsl-selector-enrichment/scripts/enrich_selectors.py \
+  --mode probe \
+  --base-url <page-url> \
+  --reuse-session \
+  --allow-fuzzy-click \
+  --fuzzy-click-threshold 0.80 \
+  --input ./<delivery-name>/ui-dsl/ui-test.dsl.yaml \
+  --output ./<delivery-name>/ui-dsl/ui-test.enriched.dsl.yaml \
+  --report ./<delivery-name>/ui-dsl/selector-enrichment-report.md \
+  --unresolved ./<delivery-name>/ui-dsl/unresolved-selectors.md
+```
+
+`--fuzzy-click-threshold 0.80` 更适合页面探索、selector 冷启动和移动端导航，但风险更高，不建议与 `--persist-runtime` 同时用于第一轮补全。阈值必须在 `0.0` 到 `1.0` 之间。
+
 如果未传 `--input`，脚本会查找 `*/ui-dsl/ui-test.dsl.yaml`。仅找到一个文件时自动使用该文件并把输出写到同级目录；找到多个文件时停止，要求用户指定 delivery-name 或输入路径。
 
 ## probe 安全边界
@@ -133,6 +167,8 @@ wait_for
 - target selector 已经是 confirmed，例如 seed selector
 - 当前页面 probe 唯一命中并写回 confirmed
 - 当前 flow 的第一个 click 通过 limited fallback 唯一命中 `role=button`、`role=link` 或 `text=` 候选
+
+启用 `--allow-fuzzy-click` 时，第一个 click 仍必须满足唯一可见元素：`visible_count == 1`。只有 fuzzy `score >= --fuzzy-click-threshold` 才允许 runtime click；报告会记录 `score`、`threshold` 和 `fuzzy_allowed`。即使 fuzzy runtime click 成功，也默认不会写回 confirmed，除非显式传入 `--persist-runtime`。
 
 如果 confirmed selector 在执行前匹配数量不是 1，当前 click 必须跳过并记录 unstable confirmed selector，不能中断整个 flow；后续 step 和 flow 结束后的 selector count 探测仍需继续执行。
 

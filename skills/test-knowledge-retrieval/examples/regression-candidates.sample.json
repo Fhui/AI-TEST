@@ -1,0 +1,24 @@
+[
+  {
+    "id": "REG-001",
+    "title": "退款回调幂等回归",
+    "source_asset": "defect-refund-callback-dup-2026-02",
+    "reason": "历史线上缺陷命中当前退款回调接口和幂等风险。",
+    "matched_signals": ["module:refund", "interface:POST /refund/callback", "risk:幂等"],
+    "priority": "high",
+    "suggested_scope": "使用相同业务 ID 重复回调，验证最终状态和账务写入都只发生一次。",
+    "xmind_path": "",
+    "xmind_exists": false
+  },
+  {
+    "id": "REG-002",
+    "title": "退款成功通知去重",
+    "source_asset": "shared-notification-dedupe",
+    "reason": "下游通知 shared 规则命中当前退款成功事件。",
+    "matched_signals": ["downstream:通知系统", "risk:通知重复"],
+    "priority": "medium",
+    "suggested_scope": "触发回调重试，验证用户侧只收到一次退款成功通知。",
+    "xmind_path": "",
+    "xmind_exists": false
+  }
+]

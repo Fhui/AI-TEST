@@ -1,0 +1,85 @@
+{
+  "system": "order",
+  "module": "refund",
+  "version": "v3.2",
+  "retrieval_summary": {
+    "knowledge_not_found": false,
+    "strong_count": 3,
+    "medium_count": 2,
+    "weak_count": 1,
+    "summary": "历史退款状态、回调幂等和通知去重资料与当前 PRD 相关。",
+    "knowledge_roots": {
+      "default_root": "knowledge-base",
+      "env_roots": ["TEST_KNOWLEDGE_ROOTS"],
+      "note": "通过 MCP allowed roots 检索，未直接扫描本地目录。"
+    }
+  },
+  "retrieval_plan": {
+    "business_objects": ["退款单", "支付单"],
+    "interfaces": ["POST /refund/apply", "GET /refund/status"],
+    "states": ["待处理", "已审核", "已退款", "退款失败"],
+    "roles": ["买家", "财务管理员"],
+    "upstream_dependencies": ["支付系统"],
+    "downstream_dependencies": ["通知系统"],
+    "keywords": ["退款申请", "退款状态", "支付回滚"],
+    "risk_keywords": ["幂等", "通知重复", "异步延迟"]
+  },
+  "search_attempts": [
+    {
+      "stage": "exact_module",
+      "query": {
+        "system": "order",
+        "module": "refund",
+        "business_objects": ["退款单", "支付单"],
+        "interfaces": ["POST /refund/apply", "GET /refund/status"],
+        "states": ["待处理", "已审核", "已退款", "退款失败"],
+        "roles": ["买家", "财务管理员"],
+        "upstream_dependencies": ["支付系统"],
+        "downstream_dependencies": ["通知系统"],
+        "keywords": ["退款申请", "退款状态", "支付回滚"]
+      },
+      "strong_count": 3,
+      "medium_count": 0,
+      "weak_count": 0,
+      "decision": "used",
+      "reason": "精确 module 命中历史 PRD 和测试用例。"
+    }
+  ],
+  "strong_related": [
+    {
+      "asset_id": "tc-refund-main",
+      "title": "退款主流程历史测试用例",
+      "doc_type": "historical_testcase",
+      "system": "order",
+      "module": "refund",
+      "path": "knowledge/order/refund/testcase/refund-main.md",
+      "relatedness": "strong",
+      "matched_fields": ["module", "business_object", "interface", "state"],
+      "reason": "覆盖当前退款申请和状态查询流程。",
+      "summary": "包含成功申请、重复提交、回调重试和状态查询检查点。",
+      "source_ts": "2026-03-18"
+    }
+  ],
+  "medium_related": [],
+  "weak_related": [],
+  "reused_testcases": [
+    {
+      "id": "TC-REFUND-001",
+      "title": "退款申请幂等",
+      "source_asset": "tc-refund-main",
+      "md_path": "knowledge/order/refund/testcase/refund-main.md",
+      "xmind_path": "knowledge/order/refund/testcase/refund-main.xmind",
+      "xmind_exists": true,
+      "matched_signals": ["POST /refund/apply", "幂等"],
+      "reuse_reason": "当前 PRD 变更退款申请行为，并命中历史重复提交风险。",
+      "summary": "重复提交同一退款请求，验证只创建一笔退款单。"
+    }
+  ],
+  "regression_candidates": [],
+  "risk_candidates": [],
+  "upstream_dependencies": [],
+  "downstream_dependencies": [],
+  "shared_rules": [],
+  "conflicts": [],
+  "open_questions": []
+}

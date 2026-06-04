@@ -1,0 +1,41 @@
+{
+  "system": "sample-system",
+  "module": "sample-module",
+  "testcase_summary": {
+    "total_cases": 64,
+    "p0_cases": 20,
+    "regression_cases": 12
+  },
+  "traceability": [],
+  "open_questions": [],
+  "automation_candidates": [],
+  "risk_points": [],
+  "historical_context_missing": false,
+  "degraded_mode": false,
+  "context_validation": {
+    "valid": true,
+    "missing_fields": [],
+    "warnings": []
+  },
+  "context_reference": {
+    "source_files": [],
+    "reused_testcases": [],
+    "regression_candidates": [],
+    "upstream_dependencies": [],
+    "downstream_dependencies": [],
+    "conflicts": [],
+    "open_questions": []
+  },
+  "context_package": {
+    "retrieval_summary": {},
+    "workflow_hits": [],
+    "reused_testcase_refs": [],
+    "regression_candidate_refs": [],
+    "risk_candidate_refs": [],
+    "source_files": []
+  },
+  "case_count_warning": false,
+  "expected_min_case_count": 60,
+  "actual_case_count": 64,
+  "case_count_reason": ""
+}

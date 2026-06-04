@@ -1,354 +1,472 @@
 ---
 name: prd-to-xmind-testcases
-description: 将 Markdown 格式的 PRD 解析为可导入 XMind 的测试用例树。适用于需要分阶段处理 PRD、提取图片、区分流程图或时序图与原型图、借助 image-mcp 提取图片结构化结果、将明确可判定的流程图或时序图整理为 PlantUML、先做对象状态行为规则依赖抽象建模、再做结构化分析、测试点建模，最后通过 file-system-mcp 逐阶段落盘生成 XMind 风格测试用例的场景。
+description: 将 Markdown PRD 按复杂度自适应解析为可导入 XMind 的测试用例树，并输出 Markdown、JSON、CSV 与 pipeline-output.json。适用于读取当前 PRD，按需触发 test-knowledge-retrieval，消费 context package，执行 analysis-lite 或完整系统建模，经过 testpoint 与 testcase-expansion 矩阵展开后生成测试用例。
 ---
 
 # PRD 转 XMind 测试用例
 
 ## 目标
 
-将 Markdown PRD 按严格 pipeline 分阶段处理，避免一次性输出过大导致断流、重连或超时。
+将当前 PRD 转换为可导入 XMind 的测试用例树，并同步输出 JSON、CSV、pipeline-output.json，供 UI DSL、Playwright、API 自动化和 Traceability 后续链路使用。
+本 skill 采用复杂度自适应 pipeline：
 
-保留以下能力：
+- simple：`analysis-lite -> testcase`
+- normal：`analysis -> testpoint -> testcase-expansion -> testcase`
+- complex：`assets -> plantuml -> analysis -> testpoint -> testcase-expansion -> testcase`
 
-- 读取 Markdown PRD
-- 提取图片
-- 区分流程图 / 时序图 / 原型图 / 截图
-- 将明确可判定的流程图或时序图转换为 PlantUML
-- 先做抽象建模
-- 再做结构化分析
-- 再做测试点建模
-- 最后生成 XMind 风格测试用例
+所有 pipeline 前置执行：
 
-执行类动作不在 skill 内直接执行。
-凡是创建目录、写文件、读文件、列目录，都必须通过 `file-system-mcp` 提供的 tools 完成：
+- `Phase 0: complexity-analysis`
+- `Phase 0.3: context-retrieval`
+- `Phase 0.5: context-consumption`
+
+## 职责边界
+
+负责：
+
+- 读取当前 Markdown PRD
+- 判断复杂度并选择 pipeline
+- 在需要历史上下文时触发 `test-knowledge-retrieval`
+- 消费 `context-retrieval.md` 与 `context-package.json`
+- 生成 `context-reference.md`
+- 执行轻量分析或完整结构化分析
+- 将测试点展开为 testcase expansion matrix
+- 生成 Markdown / JSON / CSV / pipeline-output.json
+
+不负责：
+
+- 扫描知识库
+- 直接调用 `test-knowledge-mcp`
+- 直接读取知识库根目录
+- 自己做 metadata 提取、召回、rerank
+- 解析 `.xmind`
+- 生成自动化脚本
+- 执行测试
+
+## Capability 强约束
+
+必须读取 [references/capability-abstraction.md](references/capability-abstraction.md)。
+文件系统操作必须通过 filesystem capability：
 
 - `mkdir`
 - `write_file`
 - `read_file`
 - `list_dir`
 
-凡是下载图片、分类图片、OCR、提取流程图中间结构，都必须通过 `image-mcp` 提供的 tools 完成：
+图片处理必须通过 image capability：
 
 - `download_image`
 - `classify_image`
 - `ocr_image`
 - `extract_flow_elements`
 
-## 适用场景
+禁止：
 
-当用户需要基于 PRD 生成测试用例，且 PRD 中可能包含流程图、时序图、原型图、截图或复杂业务规则时，使用此 skill。
+- 直接写文件、创建目录、读取目录
+- 直接下载图片、直接 OCR、直接图片分类
+- 在 capability 不可用时自行兜底
 
-不要用在以下场景：
+## Knowledge Retrieval 依赖
 
-- 执行测试
-- 生成自动化脚本
-- 在 PRD 未说明时补业务规则
-- 一次性把所有中间产物和最终产物直接输出到对话
+必须读取：
 
-## 职责边界
+- [references/retrieval-trigger-strategy.md](references/retrieval-trigger-strategy.md)
+- [references/context-package-schema.md](references/context-package-schema.md)
+- [references/context-validation.md](references/context-validation.md)
+- [references/context-consumption.md](references/context-consumption.md)
+- [references/context-compression.md](references/context-compression.md)
 
-skill 负责：
+调用链路只能是：
 
-- 解析 Markdown PRD
-- 抽象对象、状态、行为、规则、依赖
-- 决定执行顺序
-- 决定哪些图片要进入流程分析
-- 结合 `PRD 文本 + 图片结构化结果 + PlantUML` 做结构化分析
-- 做测试点建模
-- 生成最终测试用例内容
+```text
+prd-to-xmind-testcases
+-> test-knowledge-retrieval
+-> test-knowledge-mcp
+-> context-package.json
+-> context-consumption / analysis / testpoint / testcase
+```
 
-MCP 负责：
+禁止：
 
-- 创建目录
-- 写文件
-- 读文件
-- 列目录
-- 下载图片
-- 图片分类
-- OCR
-- 提取流程图中间结构
+```text
+prd-to-xmind-testcases -> test-knowledge-mcp
+```
 
-## 路径规则
+`.md` 是 AI source。`.xmind` 只能作为 human preview / traceability 路径。
 
-所有运行产物必须写入项目根目录下、与 `.codex` 同级的单独目录：
+## 输出路径规则
 
-- `./<delivery-name>/`
-
-目录结构固定为：
+所有运行产物必须写入项目根目录下、与 `.codex` 同级的 `./<delivery-name>/`，禁止写入 `.codex/` 或 skill 目录。
 
 - `./<delivery-name>/assets/`
 - `./<delivery-name>/plantuml/`
+- `./<delivery-name>/analysis/complexity-analysis.md`
+- `./<delivery-name>/analysis/context-retrieval.md`
+- `./<delivery-name>/analysis/context-package.json`
+- `./<delivery-name>/analysis/context-reference.md`
+- `./<delivery-name>/analysis/analysis-lite.md`
 - `./<delivery-name>/analysis/structured-analysis.md`
 - `./<delivery-name>/analysis/testpoint-model.md`
+- `./<delivery-name>/analysis/testcase-expansion.md`
 - `./<delivery-name>/testcase/xmind-testcases.md`
+- `./<delivery-name>/testcase/xmind-testcases.json`
+- `./<delivery-name>/testcase/xmind-import.csv`
+- `./<delivery-name>/pipeline-output.json`
 
-其中：
+## Pipeline Overview
 
-- `delivery-name` 优先使用系统名称
-- 若系统名称不明确，再使用规范化后的 `prd-name`
+所有 phase 必须遵守 [references/loading-strategy.md](references/loading-strategy.md)，只读取当前 phase 允许的 references。
 
-强约束：
+必须先执行 `Phase 0 -> Phase 0.3 -> Phase 0.5`，再按复杂度执行核心阶段：
 
-- 禁止将任何运行产物写入 `.codex/`
-- 禁止将任何运行产物写入 skill 目录
-- skill 目录下若存在旧的 `assets/`、`plantuml/`、`testcase/`，它们都不是运行输出目录
-- 禁止直接下载图片
-- 禁止直接写入文件
-- 禁止直接创建目录
-- 禁止直接读取目录
-- 必须调用 `file-system-mcp` 的 `mkdir / write_file / read_file / list_dir`
-- 必须调用 `image-mcp` 的 `download_image / classify_image / ocr_image / extract_flow_elements`
-- 如果当前工作目录不是项目根目录，先停止并提示用户确认，不要落盘
+- simple：2 phase
+  - `analysis-lite`
+  - `testcase`
+- normal：4 phase
+  - `analysis`
+  - `testpoint`
+  - `testcase-expansion`
+  - `testcase`
+- complex：6 phase
+  - `assets`
+  - `plantuml`
+  - `analysis`
+  - `testpoint`
+  - `testcase-expansion`
+  - `testcase`
 
-## 抽象优先
+`testpoint` 不是最终 testcase。normal / complex 禁止跳过 `testcase-expansion`。
 
-在 `analysis` 和 `testpoint` 阶段，必须先抽象出：
+## Phase 0: complexity-analysis
 
-- 对象
-- 状态
-- 行为
-- 规则
-- 依赖
+当前 phase 必须遵守 `references/loading-strategy.md` 中 `complexity-analysis` 的 loading strategy。
 
-然后再映射回 PRD 原始术语。
-不要直接拿具体业务词充当通用分析框架。
+读取 [references/complexity-analysis.md](references/complexity-analysis.md)。
 
-## 强制建模问题（升级版）
+目标：
 
-在进入 `Phase 5: testcase` 之前，必须回答以下问题：
+- 读取 PRD
+- 判断复杂度：`simple / normal / complex`
+- 选择 pipeline
+- 记录跳过阶段和原因
 
-1. 核心对象及其生命周期
-2. 状态机完整性（含非法迁移）
-3. 行为语义（含副作用）
-4. 数据约束（含跨字段）
-5. 权限控制维度
-6. 异步/依赖/事务机制
-7. 失败补偿与幂等机制
-8. 边界与极端情况
+输出：
 
-如果这 8 个问题没有回答完整，不要进入 `testcase` 阶段。
+- `./<delivery-name>/analysis/complexity-analysis.md`
 
-## analysis 完整性约束
+必须包含：
 
-在 `Phase 3: analysis` 阶段，必须执行覆盖性检查：
+- PRD 名称
+- system / module 推断
+- 图片数量
+- 流程图 / 时序图可能性
+- 状态、角色、依赖、异步、事务、补偿、复杂规则判断
+- complexity
+- selected_pipeline
+- skipped_phases
+- skip_reason
 
-- 状态是否完整
-- 行为是否完整
-- 数据规则是否完整
-- 权限是否完整
-- 异常路径是否完整
+## Phase 0.3: context-retrieval
 
-如果不完整，必须补充推断或标记 `PRD未说明`。
-禁止跳过不完整项。
+当前 phase 必须遵守 `references/loading-strategy.md` 中 `context-retrieval` 的 loading strategy。
 
-## 执行约束
+读取 [references/retrieval-trigger-strategy.md](references/retrieval-trigger-strategy.md) 与 [references/workflow-modeling.md](references/workflow-modeling.md)。
 
-严格按阶段执行，不要跳阶段，不要合并阶段。
+目标：
 
-- 禁止一次性输出完整大文件内容到对话
-- 禁止把所有阶段结果攒到最后一起输出
-- 必须每阶段完成后立即落盘
-- 所有阶段落盘都必须通过 `file-system-mcp`
-- 所有图片处理都必须通过 `image-mcp`
-- 在聊天中只输出简短状态，不输出长篇正文
-- 如果用户明确要求查看某个文件内容，才允许读取并展示该文件
+- 基于当前 PRD 和 `complexity-analysis.md` 构建 retrieval query
+- 调用/切换 `test-knowledge-retrieval`
+- 校验 `context-retrieval.md` 与 `context-package.json` 是否存在
 
-每个阶段完成后，只输出对应状态：
+retrieval query 至少包含：system、module、business_objects、interfaces、states、roles、upstream/downstream_dependencies、workflow / journey、keywords、risk_keywords。
 
-- `[✓] assets 完成`
-- `[✓] plantuml 完成`
-- `[✓] analysis 完成`
-- `[✓] testpoint 完成`
-- `[✓] testcase 完成`
+如果 `context-package.json` 不存在、非法、过期，或当前 PRD 与 context package 不匹配，必须重新执行 `test-knowledge-retrieval`。
 
-## 分阶段流程
+执行 retrieval 时至少传递：当前 PRD、`complexity-analysis.md`、delivery-name、输出目录、retrieval query。
 
-### Phase 1: assets
+输出：
 
-- 目标
-  - 从 PRD 提取全部图片 URL
-  - 调用 MCP 下载图片并建立图片索引
-- 输入
-  - Markdown PRD
-  - 图片链接
-- 输出目录
-  - `./<delivery-name>/assets/`
-- 产出文件
-  - 原始图片文件
-  - `./<delivery-name>/assets/image-index.md`
-- MCP 动作
-  - 调用 `file-system-mcp.list_dir` 检查目标目录
-  - 调用 `file-system-mcp.mkdir` 创建目录
-  - 调用 `image-mcp.download_image` 下载图片
-  - 调用 `file-system-mcp.write_file` 写入 `image-index.md`
-- 完成状态
-  - `[✓] assets 完成`
-- 读取资源
-  - [references/diagram-assets-and-plantuml.md](references/diagram-assets-and-plantuml.md)
+- `./<delivery-name>/analysis/context-retrieval.md`
+- `./<delivery-name>/analysis/context-package.json`
 
-### Phase 2: plantuml
+Phase 0.3 只负责构建 query、调用 retrieval skill、校验 retrieval 输出。
 
-- 目标
-  - 对每张图片做分类
-  - 仅对流程图或时序图提取结构化中间结果
-  - skill 决定是否生成 PlantUML 文本
-- 输入
-  - PRD 文本
-  - `Phase 1` 下载的图片
-  - `image-index.md`
-- 输出目录
-  - `./<delivery-name>/plantuml/`
-- 产出文件
-  - `.puml` 文件
-  - `./<delivery-name>/plantuml/index.md`
-- MCP 动作
-  - 调用 `file-system-mcp.list_dir` 检查输入资产
-  - 调用 `image-mcp.classify_image` 对每张图片分类
-  - 对流程图或时序图调用 `image-mcp.extract_flow_elements`
-  - 如分类判断或 OCR 需要补充证据，可调用 `image-mcp.ocr_image`
-  - 调用 `file-system-mcp.mkdir` 创建目录
-  - skill 根据 `PRD 文本 + flow elements` 生成 PlantUML 文本
-  - 调用 `file-system-mcp.write_file` 写入 `.puml` 与 `index.md`
-- 完成状态
-  - `[✓] plantuml 完成`
-- 读取资源
-  - [references/diagram-assets-and-plantuml.md](references/diagram-assets-and-plantuml.md)
+Phase 0.3 不负责 `search_context`、`read_context_documents`、metadata extraction、rerank、knowledge indexing；这些必须由 `test-knowledge-retrieval` 和 `test-knowledge-mcp` 负责。
 
-### Phase 3: analysis
+禁止 `prd-to-xmind-testcases` 自行伪造 retrieval 结果。
 
-- 目标
-  - 基于 `PRD 文本 + 图片分类结果 + flow elements + PlantUML` 完成结构化分析
-  - 从对象、状态、行为、规则、依赖升级为 6 大建模维度
-  - 强制回答升级版 8 个强制建模问题
-  - 强制执行完整性约束
-- 输入
-  - Markdown PRD
-  - `Phase 1` 资产
-  - `Phase 2` PlantUML
-  - 图片分类结果
-  - flow elements
-- 子阶段
-  - `3.1 Domain`
-    - 单独建立 Domain Model
-    - 识别对象、类型（主体 / 资源 / 关系 / 配置 / 结果）、生命周期、上下游关系、是否持久化
-  - `3.2 State`
-    - 单独建立 State Machine
-    - 识别状态列表、状态迁移矩阵、非法迁移、状态幂等性、并发状态
-  - `3.3 Behavior`
-    - 单独建立 Behavior Model
-    - 每个行为必须拆成输入、前置条件、处理逻辑、副作用、输出
-  - `3.4 Data`
-    - 单独建立 Data Rules
-    - 拆分输入约束、业务规则、结果约束、跨字段约束、时间约束、幂等约束
-  - `3.5 Permission`
-    - 单独建立 Permission Model
-    - 识别身份权限、操作权限、数据范围权限、时间权限
-  - `3.6 System`
-    - 单独建立 System Behavior
-    - 强制分析同步 / 异步、事务边界、重试机制、幂等机制、失败补偿、外部依赖 SLA
-  - 最后合并 3.1~3.6 为 `structured-analysis.md`
-- 完整性约束
-  - 必须检查状态是否完整
-  - 必须检查行为是否完整
-  - 必须检查数据规则是否完整
-  - 必须检查权限是否完整
-  - 必须检查异常路径是否完整
-  - 如果不完整，必须补充推断或标记 `PRD未说明`
-  - 禁止跳过不完整项
-- 输出目录
-  - `./<delivery-name>/analysis/`
-- 产出文件
-  - `./<delivery-name>/analysis/structured-analysis.md`
-- MCP 动作
-  - 调用 `file-system-mcp.read_file` 读取必要的中间文件
-  - 调用 `file-system-mcp.mkdir` 创建目录
-  - 调用 `file-system-mcp.write_file` 写入 `structured-analysis.md`
-- 完成状态
-  - `[✓] analysis 完成`
-- 读取资源
-  - [references/prd-structured-analysis.md](references/prd-structured-analysis.md)
+## Phase 0.5: context-consumption
 
-### Phase 4: testpoint
+当前 phase 必须遵守 `references/loading-strategy.md` 中 `context-consumption` 的 loading strategy。
 
-- 目标
-  - 读取 `structured-analysis.md`
-  - 不复制完整结构化分析
-  - 将完整分析压缩并映射为模块级测试点模型
-  - 只保留可直接驱动测试用例生成的测试点
-- 输入
-  - `./<delivery-name>/analysis/structured-analysis.md`
-  - PRD 原文
-  - PlantUML
-- 要求
-  - `testpoint-model.md` 不是分析摘要
-  - `testpoint-model.md` 不是 `structured-analysis.md` 的缩写版
-  - 必须按测试类型组织：
-    - 主路径测试
-    - 分支路径测试
-    - 异常路径测试
-    - 状态测试
-    - 权限测试
-    - 数据约束测试
-    - 通知测试
-    - 场景测试
-    - 失败补偿测试
-  - 每个测试点必须能追溯到 `structured-analysis.md` 中的对象、状态、行为、规则或依赖
-  - 不要把完整分析内容复制进 `testpoint-model.md`
-- 输出目录
-  - `./<delivery-name>/analysis/`
-- 产出文件
-  - `./<delivery-name>/analysis/testpoint-model.md`
-- MCP 动作
-  - 调用 `file-system-mcp.read_file` 读取 `structured-analysis.md`
-  - 调用 `file-system-mcp.write_file` 写入 `testpoint-model.md`
-- 完成状态
-  - `[✓] testpoint 完成`
-- 读取资源
-  - [references/testpoint-modeling.md](references/testpoint-modeling.md)
+读取：
 
-### Phase 5: testcase
+- [references/context-consumption.md](references/context-consumption.md)
+- [references/context-validation.md](references/context-validation.md)
+- [references/context-compression.md](references/context-compression.md)
+- [references/traceability-rules.md](references/traceability-rules.md)
 
-- 目标
-  - 将测试点模型拆成最终 XMind 风格测试用例
-  - 输出严格符合模板的树形 Markdown
-- 输入
-  - `structured-analysis.md`
-  - `testpoint-model.md`
-  - Markdown PRD
-  - PlantUML
-- 输出目录
-  - `./<delivery-name>/testcase/`
-- 产出文件
-  - `./<delivery-name>/testcase/xmind-testcases.md`
-- MCP 动作
-  - 调用 `file-system-mcp.read_file` 读取 `structured-analysis.md` 与 `testpoint-model.md`
-  - 调用 `file-system-mcp.mkdir` 创建目录
-  - 调用 `file-system-mcp.write_file` 写入 `xmind-testcases.md`
-- 完成状态
-  - `[✓] testcase 完成`
-- 读取资源
-  - [references/case-rules.md](references/case-rules.md)
-  - [references/output-template.md](references/output-template.md)
-  - [examples/sample-output.md](examples/sample-output.md)
+目标：
 
-## 错误处理
+- 校验 context package
+- 压缩历史上下文
+- 识别影响范围、冲突、回归候选、风险候选、上下游影响
+- 生成当前 skill 使用的压缩上下文
 
-- 如果图片下载失败，继续后续阶段，但必须在对应落盘文件中记录缺口
-- 如果图片无法确认是否属于流程图或时序图，默认不转 PlantUML
-- 如果正文与图片冲突，以正文为主，并在落盘文件中记为 `待确认项`
-- 如果结构化分析未完成或 8 个强制问题未回答完整，停止在 `analysis` 或 `testpoint` 阶段，不进入 `testcase`
-- 如果路径不在项目根目录，先停止并提示用户确认，不要创建目录
-- 如果 `file-system-mcp` 不可用，先停止并提示用户， 不要改用直接写文件作为兜底
-- 如果 `image-mcp` 不可用，先停止并提示用户，不要改用直接下载、直接 OCR 或直接图片分类作为兜底
+输出：
+
+- `./<delivery-name>/analysis/context-reference.md`
+
+context package 缺失、非法、retrieval 不可用时，进入 degraded context mode，但继续后续 pipeline。
+
+## Phase analysis-lite
+
+当前 phase 必须遵守 `references/loading-strategy.md` 中 `analysis-lite` 的 loading strategy。
+
+读取 [references/analysis-lite.md](references/analysis-lite.md)。
+
+适用：simple。
+
+目标：
+
+- 不做完整 6 大建模
+- 抽取 testcase 所需最小 expansion model
+- 检查 context 中的 regression / risk / workflow / upstream / downstream impact
+
+输出：
+
+- `./<delivery-name>/analysis/analysis-lite.md`
+
+simple 不生成 `testcase-expansion.md`，但 `analysis-lite.md` 必须内置 lightweight expansion matrix。
+
+`analysis-lite` 不是功能点摘要，而是 simple testcase generation 的最小 expansion model。
+
+即使是 simple，也必须展开：主流程、分支流程、异常流程、regression hits、workflow hits、risk hits。
+
+simple expansion 优先覆盖：主流程、高频 workflow、regression candidates、历史风险、边界值。
+
+禁止 simple pipeline 一个功能点只生成一条 case。
+
+如果存在 regression/risk/workflow 命中，最终 testcase 必须落地对应用例或写入 skip reason。
+
+## Phase 1: assets
+
+当前 phase 必须遵守 `references/loading-strategy.md` 中 `assets` 的 loading strategy。
+
+适用：complex。
+
+目标：
+
+- 提取 PRD 图片
+- 下载图片
+- 建立图片索引
+
+输出：
+
+- `./<delivery-name>/assets/`
+- `./<delivery-name>/assets/image-index.md`
+
+只处理当前 PRD 中的图片。simple / normal 禁止强制走图片 pipeline。
+
+## Phase 2: plantuml
+
+当前 phase 必须遵守 `references/loading-strategy.md` 中 `plantuml` 的 loading strategy。
+
+适用：complex。
+目标：
+
+- 分类图片
+- 对流程图 / 时序图提取结构化元素
+- 生成 PlantUML 中间产物
+
+输出：
+
+- `./<delivery-name>/plantuml/*.puml`
+- `./<delivery-name>/plantuml/index.md`
+
+原型图、截图、页面图默认不转 PlantUML。
+
+## Phase 3: analysis
+
+当前 phase 必须遵守 `references/loading-strategy.md` 中 `analysis` 的 loading strategy。
+
+读取 [references/prd-structured-analysis.md](references/prd-structured-analysis.md)。
+
+适用：normal / complex。
+
+目标：
+
+- 基于当前 PRD、context-reference、context-package 和必要中间产物进行完整建模
+- 完成 6 大建模维度
+- 回答 8 个强制建模问题
+- 做完整性检查
+
+输出：
+
+- `./<delivery-name>/analysis/structured-analysis.md`
+
+历史上下文必须参与需求点拆分、影响范围、规则复用、冲突识别和回归候选判断，但不能覆盖当前 PRD。
+
+## Phase 4: testpoint
+
+当前 phase 必须遵守 `references/loading-strategy.md` 中 `testpoint` 的 loading strategy。
+
+读取 [references/testpoint-modeling.md](references/testpoint-modeling.md)。
+适用：normal / complex。
+目标：
+
+- 将 structured-analysis 压缩为测试点模型
+- 动态输出测试点分类
+- 将历史命中的 reused/regression/risk/workflow 转成测试点或待确认项
+
+输出：
+
+- `./<delivery-name>/analysis/testpoint-model.md`
+
+禁止把完整分析复制进 testpoint。禁止把全部历史用例无脑转为回归测试点。
+
+## Phase 4.5: testcase-expansion
+
+当前 phase 必须遵守 `references/loading-strategy.md` 中 `testcase-expansion` 的 loading strategy。
+
+在加载 domain profiles 前，必须执行 [references/profile-selection-heuristic.md](references/profile-selection-heuristic.md)。
+
+`selected_domain_profiles` 必须来源于 `references/profile-selection-heuristic.md` 的 rule-based selection output。
+
+读取：
+
+- [references/testcase-expansion.md](references/testcase-expansion.md)
+- [references/domain-expansion/generic.md](references/domain-expansion/generic.md)
+- 按 domain profile 选择规则读取额外 profile
+
+适用：normal / complex。
+目标：
+
+- 将 testpoint 展开为 expansion matrix
+- 将测试点按业务维度、状态、数据、角色、配置、异常、workflow、历史回归等维度组合
+- 生成可执行 testcase groups
+- 生成 `expected_case_count`
+
+domain profile 必须按 system、module、workflow、business objects、terminology 推断。
+
+domain profiles 必须包含结构化 Markdown frontmatter metadata，用于后续 profile routing 与 heuristic selection。
+
+如果无法明确判断领域，只允许读取 `references/domain-expansion/generic.md`。
+
+禁止无法判断领域时同时加载多个无关 profile。
+
+`testcase-expansion.md` 必须记录 `selected_domain_profiles` 与 `selection_reason`。
+
+domain profiles 与 examples 必须遵守 `references/loading-strategy.md`。
+
+输出：
+
+- `./<delivery-name>/analysis/testcase-expansion.md`
+
+禁止：
+
+- `testpoint -> testcase` 直接生成
+- 一个测试点只生成一条代表性 case
+- 把具体业务组合硬编码进主流程
+
+## Phase 5: testcase
+
+当前 phase 必须遵守 `references/loading-strategy.md` 中 `testcase` 的 loading strategy。
+
+读取：
+
+- [references/xmind-output-format.md](references/xmind-output-format.md)
+- [references/pipeline-output-schema.md](references/pipeline-output-schema.md)
+- [references/traceability-rules.md](references/traceability-rules.md)
+
+输入：
+
+- simple：`analysis-lite.md`
+- normal / complex：`testpoint-model.md` + `testcase-expansion.md`
+- 所有复杂度：当前 PRD、`context-reference.md`、`context-package.json`（如存在）
+
+输出：
+
+- `./<delivery-name>/testcase/xmind-testcases.md`
+- `./<delivery-name>/testcase/xmind-testcases.json`
+- `./<delivery-name>/testcase/xmind-import.csv`
+- `./<delivery-name>/pipeline-output.json`
+
+Markdown 必须对齐知识库历史用例格式，只承载 XMind 树。traceability、context_source、source_reason、ai_source_path、xmind_path 必须进入 JSON / CSV / pipeline-output.json。
+
+必须统计 `actual_case_count`。
+
+如果 `actual_case_count` 明显低于 `expected_case_count`，必须输出 `case_count_warning`，写入 `pipeline-output.json`，并给出 `case_count_reason`：
+
+```json
+{
+  "case_count_warning": true,
+  "expected_case_count": 80,
+  "actual_case_count": 32,
+  "case_count_reason": "workflow branches not fully expanded"
+}
+```
+
+case 数量不是唯一目标，但 expansion coverage 必须满足 workflow / regression / risk 覆盖。
+
+## 关键禁止项
+
+禁止：
+
+- 删除 degraded context mode
+- 删除 workflow awareness
+- 删除 context validation
+- 删除 filesystem / image capability 强约束
+- 删除 `.md` / `.xmind` 边界
+- 删除 pipeline-output.json
+- 删除 traceability
+- 删除 retrieval dependency
+- 删除 context package
+- 跳过 testcase-expansion
+- 在主流程硬编码具体业务规则
+- 将 references 内容重新塞回 `SKILL.md`
+- 因历史上下文缺失而终止整个 testcase pipeline
 
 ## 资源引用
 
-- 使用 `file-system-mcp` 的 `mkdir / write_file / read_file / list_dir` 执行全部文件系统操作
-- 使用 `image-mcp` 的 `download_image / classify_image / ocr_image / extract_flow_elements` 执行全部图片处理操作
-- 使用 [references/diagram-assets-and-plantuml.md](references/diagram-assets-and-plantuml.md) 处理图片、索引和 PlantUML
-- 使用 [references/prd-structured-analysis.md](references/prd-structured-analysis.md) 生成结构化分析
-- 使用 [references/testpoint-modeling.md](references/testpoint-modeling.md) 生成测试点模型
-- 使用 [references/case-rules.md](references/case-rules.md) 拆分测试用例
-- 使用 [references/output-template.md](references/output-template.md) 套用最终输出格式
-- 仅在需要示例时读取 [examples/sample-output.md](examples/sample-output.md)
+必须遵守 [references/loading-strategy.md](references/loading-strategy.md)。
+
+`SKILL.md` 只定义 phase orchestration contract；详细 required / optional / forbidden reference rules 由 `references/loading-strategy.md` 统一定义。
+
+必须按阶段读取对应 reference。不要一次性加载全部 references。
+
+domain profiles 按需读取。默认只读取 `references/domain-expansion/generic.md`；只有明确命中领域语义时，才允许加载额外 profile。
+
+domain profiles 必须包含 `profile_id / profile_type / display_name / description / match_systems / match_modules / match_keywords / match_workflows / match_business_objects / priority / related_profiles / fallback_priority` frontmatter。
+
+- [references/loading-strategy.md](references/loading-strategy.md)
+- [references/capability-abstraction.md](references/capability-abstraction.md)
+- [references/complexity-analysis.md](references/complexity-analysis.md)
+- [references/retrieval-trigger-strategy.md](references/retrieval-trigger-strategy.md)
+- [references/context-consumption.md](references/context-consumption.md)
+- [references/prd-structured-analysis.md](references/prd-structured-analysis.md)
+- [references/testpoint-modeling.md](references/testpoint-modeling.md)
+- [references/testcase-expansion.md](references/testcase-expansion.md)
+- [references/profile-selection-heuristic.md](references/profile-selection-heuristic.md)
+- [references/xmind-output-format.md](references/xmind-output-format.md)
+- [references/pipeline-output-schema.md](references/pipeline-output-schema.md)
+- [references/error-handling.md](references/error-handling.md)
+- [references/domain-expansion/generic.md](references/domain-expansion/generic.md)
+- 领域明确命中时再按需读取 `references/domain-expansion/*.md`
+
+examples 仅用于 few-shot，不得当作主规则。
+
+## 完成状态
+
+每个阶段完成后只输出简短状态：
+
+- `[✓] complexity-analysis 完成`
+- `[✓] context-retrieval 完成`
+- `[✓] context-consumption 完成`
+- `[✓] assets 完成`
+- `[✓] plantuml 完成`
+- `[✓] analysis-lite 完成`
+- `[✓] analysis 完成`
+- `[✓] testpoint 完成`
+- `[✓] testcase-expansion 完成`
+- `[✓] testcase 完成`
